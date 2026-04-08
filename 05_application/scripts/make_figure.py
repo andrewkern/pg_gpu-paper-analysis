@@ -167,6 +167,11 @@ def make_figure(n_hap, n_var, df_div, df_neut, df_div2, df_garud, sfs_pop1, jsfs
                   width_ratios=[3, 1],
                   left=0.06, right=0.96, top=0.95, bottom=0.04)
 
+    # Gste cluster coordinates (glutathione S-transferase epsilon, 3R:28.48-28.60 Mb)
+    GSTE_START_MB = 28.48
+    GSTE_END_MB = 28.60
+    scan_axes = []  # collect all scan panel axes for region shading
+
     panel_idx = 0
 
     def add_scan_panel(y, label, ylabel, color='#2c3e50', alpha=0.6, hline=None):
@@ -183,6 +188,7 @@ def make_figure(n_hap, n_var, df_div, df_neut, df_div2, df_garud, sfs_pop1, jsfs
             ax.set_xticklabels([])
         else:
             ax.set_xlabel(f'{CHROM} position (Mb)', fontsize=9)
+        scan_axes.append(ax)
         panel_idx += 1
         return ax
 
@@ -225,11 +231,18 @@ def make_figure(n_hap, n_var, df_div, df_neut, df_div2, df_garud, sfs_pop1, jsfs
     ax.tick_params(labelsize=7)
     ax.set_xlim(pos_mb[0], pos_mb[-1])
     ax.set_xlabel(f'{CHROM} position (Mb)', fontsize=9)
+    scan_axes.append(ax)
     panel_idx += 1
 
-    # # Row 8: Segregating sites
-    # add_scan_panel(df_div['segregating_sites'].values, 'Segregating sites per window',
-    #                'S', color='#7f8c8d')
+    # Shade Gste cluster region on all scan panels
+    for sax in scan_axes:
+        sax.axvspan(GSTE_START_MB, GSTE_END_MB, alpha=0.15, color='#e74c3c',
+                    zorder=0)
+    # Label on top panel only
+    scan_axes[0].text((GSTE_START_MB + GSTE_END_MB) / 2,
+                      scan_axes[0].get_ylim()[1],
+                      'Gste', ha='center', va='bottom', fontsize=7,
+                      fontstyle='italic', color='#c0392b')
 
     # --- Right column: SFS (rows 0-2) ---
     ax_sfs = fig.add_subplot(gs[0:3, 1])
