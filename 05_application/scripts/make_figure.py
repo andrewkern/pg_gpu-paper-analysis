@@ -4,6 +4,7 @@ Generate the Ag1000G genome scan figure from cached or recomputed data.
 Visualization-only script for rapid iteration.
 """
 
+import os
 import numpy as np
 import pandas as pd
 import cupy as cp
@@ -20,14 +21,59 @@ from pg_gpu import (
 )
 
 OUT_DIR = "05_application/figures"
+CACHE_DIR = "05_application/tables"
 ZARR_PATH = "/sietch_colab/data_share/Ag1000G/Ag3.0/vcf/AgamP3.phased.zarr"
 CHROM = "3R"
 N_DIP = 100
 WINDOW_SIZE = 100_000
 
 
+def _cache_path(name):
+    return os.path.join(CACHE_DIR, f"cached_{name}.csv")
+
+
+def _cache_exists():
+    """Check if all cached results are on disk."""
+    needed = ['div', 'neut', 'div2', 'garud', 'sfs_pop1', 'jsfs']
+    return all(os.path.exists(_cache_path(n)) for n in needed)
+
+
+def _save_cache(df_div, df_neut, df_div2, df_garud, sfs_pop1, jsfs):
+    """Save windowed results to CSV for fast iteration."""
+    df_div.to_csv(_cache_path('div'), index=False)
+    df_neut.to_csv(_cache_path('neut'), index=False)
+    df_div2.to_csv(_cache_path('div2'), index=False)
+    df_garud.to_csv(_cache_path('garud'), index=False)
+    np.savetxt(_cache_path('sfs_pop1'), sfs_pop1)
+    np.savetxt(_cache_path('jsfs'), jsfs)
+    print(f"  Cached results to {CACHE_DIR}/", flush=True)
+
+
+def _load_cache():
+    """Load windowed results from CSV."""
+    df_div = pd.read_csv(_cache_path('div'))
+    df_neut = pd.read_csv(_cache_path('neut'))
+    df_div2 = pd.read_csv(_cache_path('div2'))
+    df_garud = pd.read_csv(_cache_path('garud'))
+    sfs_pop1 = np.loadtxt(_cache_path('sfs_pop1'))
+    jsfs = np.loadtxt(_cache_path('jsfs'))
+    return df_div, df_neut, df_div2, df_garud, sfs_pop1, jsfs
+
+
 def load_and_compute():
-    """Load data and compute all windowed statistics."""
+    """Load data and compute windowed statistics, or read from cache."""
+
+    # Try cache first
+    if _cache_exists():
+        print("Loading cached results from disk...", flush=True)
+        df_div, df_neut, df_div2, df_garud, sfs_pop1, jsfs = _load_cache()
+        timing_df = pd.read_csv(os.path.join(CACHE_DIR, "ag1000g_workflow_timing.csv"))
+        # Reconstruct n_hap and n_var from the data
+        n_hap = 2940
+        n_var = 10_939_888
+        return n_hap, n_var, df_div, df_neut, df_div2, df_garud, sfs_pop1, jsfs, timing_df
+
+    # Compute from scratch
     import time
     print("Loading data...", flush=True)
     store = zarr.open_group(ZARR_PATH, mode='r')
@@ -44,14 +90,16 @@ def load_and_compute():
     hm = HaplotypeMatrix(haplotypes, positions,
                           chrom_start=int(positions[0]),
                           chrom_end=int(positions[-1]))
-    n_hap = 2 * N_DIP
+    n_hap_per_pop = 2 * N_DIP
     hm.sample_sets = {
-        "pop1": list(range(0, n_hap)),
-        "pop2": list(range(n_hap, 2 * n_hap)),
+        "pop1": list(range(0, n_hap_per_pop)),
+        "pop2": list(range(n_hap_per_pop, 2 * n_hap_per_pop)),
     }
     hm.transfer_to_gpu()
     cp.cuda.Stream.null.synchronize()
-    print(f"  {hm.num_haplotypes} haps x {hm.num_variants:,} variants", flush=True)
+    n_hap = hm.num_haplotypes
+    n_var = hm.num_variants
+    print(f"  {n_hap} haps x {n_var:,} variants", flush=True)
 
     print("Computing windowed stats...", flush=True)
     t0 = time.perf_counter()
@@ -73,18 +121,17 @@ def load_and_compute():
     sfs_pop1 = sfs_mod.sfs(hm, population="pop1")
     jsfs = sfs_mod.joint_sfs(hm, pop1="pop1", pop2="pop2")
 
-    # Read timing from CSV
-    timing_df = pd.read_csv("05_application/tables/ag1000g_workflow_timing.csv")
+    _save_cache(df_div, df_neut, df_div2, df_garud, sfs_pop1, jsfs)
 
-    return hm, df_div, df_neut, df_div2, df_garud, sfs_pop1, jsfs, timing_df
+    timing_df = pd.read_csv(os.path.join(CACHE_DIR, "ag1000g_workflow_timing.csv"))
+
+    return n_hap, n_var, df_div, df_neut, df_div2, df_garud, sfs_pop1, jsfs, timing_df
 
 
-def make_figure(hm, df_div, df_neut, df_div2, df_garud, sfs_pop1, jsfs, timing_df):
+def make_figure(n_hap, n_var, df_div, df_neut, df_div2, df_garud, sfs_pop1, jsfs, timing_df):
     """Build the multi-panel genome scan figure."""
 
     pos_mb = df_div['start'].values / 1e6
-    n_hap = hm.num_haplotypes
-    n_var = hm.num_variants
 
     # --- Layout ---
     sns.set_theme(style="darkgrid", context="paper", font_scale=0.9)
@@ -130,25 +177,25 @@ def make_figure(hm, df_div, df_neut, df_div2, df_garud, sfs_pop1, jsfs, timing_d
     add_scan_panel(df_neut['normalized_fay_wu_h'].values,
                    "Fay & Wu's H*", "H*", color='#d35400', hline=0)
 
-    # Row 4: Hudson FST
+    # Row 4: Zeng E
+    add_scan_panel(df_neut['zeng_e'].values, "Zeng's E (pop1)", 'E',
+                   color='#2c3e50', hline=0)
+    
+    # Row 5: Hudson FST
     add_scan_panel(df_div2['fst'].values, r'Hudson $F_{ST}$ (pop1 vs pop2)',
                    r'$F_{ST}$', color='#c0392b')
 
-    # Row 5: Dxy
+    # Row 6: Dxy
     add_scan_panel(df_div2['dxy'].values, r'$D_{xy}$ (pop1 vs pop2)',
                    r'$D_{xy}$', color='#16a085')
 
-    # Row 6: Garud H12
+    # Row 7: Garud H12
     add_scan_panel(df_garud['garud_h12'].values, "Garud's H12 (pop1)", 'H12',
                    color='#e67e22')
 
-    # Row 7: Zeng E
-    add_scan_panel(df_neut['zeng_e'].values, "Zeng's E (pop1)", 'E',
-                   color='#2c3e50', hline=0)
-
-    # Row 8: Segregating sites
-    add_scan_panel(df_div['segregating_sites'].values, 'Segregating sites per window',
-                   'S', color='#7f8c8d')
+    # # Row 8: Segregating sites
+    # add_scan_panel(df_div['segregating_sites'].values, 'Segregating sites per window',
+    #                'S', color='#7f8c8d')
 
     # --- Right column: SFS ---
     ax_sfs = fig.add_subplot(gs[0:3, 4])
