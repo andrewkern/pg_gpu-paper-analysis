@@ -37,17 +37,18 @@ def _cache_path(name):
 
 def _cache_exists():
     """Check if all cached results are on disk."""
-    needed = ['div', 'neut', 'div2', 'garud', 'sfs_pop1', 'jsfs']
+    needed = ['div', 'neut', 'div2', 'garud', 'sfs_west', 'sfs_east', 'jsfs']
     return all(os.path.exists(_cache_path(n)) for n in needed)
 
 
-def _save_cache(df_div, df_neut, df_div2, df_garud, sfs_pop1, jsfs):
+def _save_cache(df_div, df_neut, df_div2, df_garud, sfs_west, sfs_east, jsfs):
     """Save windowed results to CSV for fast iteration."""
     df_div.to_csv(_cache_path('div'), index=False)
     df_neut.to_csv(_cache_path('neut'), index=False)
     df_div2.to_csv(_cache_path('div2'), index=False)
     df_garud.to_csv(_cache_path('garud'), index=False)
-    np.savetxt(_cache_path('sfs_pop1'), sfs_pop1)
+    np.savetxt(_cache_path('sfs_west'), sfs_west)
+    np.savetxt(_cache_path('sfs_east'), sfs_east)
     np.savetxt(_cache_path('jsfs'), jsfs)
     print(f"  Cached results to {CACHE_DIR}/", flush=True)
 
@@ -58,9 +59,10 @@ def _load_cache():
     df_neut = pd.read_csv(_cache_path('neut'))
     df_div2 = pd.read_csv(_cache_path('div2'))
     df_garud = pd.read_csv(_cache_path('garud'))
-    sfs_pop1 = np.loadtxt(_cache_path('sfs_pop1'))
+    sfs_west = np.loadtxt(_cache_path('sfs_west'))
+    sfs_east = np.loadtxt(_cache_path('sfs_east'))
     jsfs = np.loadtxt(_cache_path('jsfs'))
-    return df_div, df_neut, df_div2, df_garud, sfs_pop1, jsfs
+    return df_div, df_neut, df_div2, df_garud, sfs_west, sfs_east, jsfs
 
 
 def load_and_compute():
@@ -69,12 +71,11 @@ def load_and_compute():
     # Try cache first
     if _cache_exists():
         print("Loading cached results from disk...", flush=True)
-        df_div, df_neut, df_div2, df_garud, sfs_pop1, jsfs = _load_cache()
+        df_div, df_neut, df_div2, df_garud, sfs_west, sfs_east, jsfs = _load_cache()
         timing_df = pd.read_csv(os.path.join(CACHE_DIR, "ag1000g_workflow_timing.csv"))
-        # Reconstruct n_hap and n_var from the data
         n_hap = 2940
         n_var = 10_939_888
-        return n_hap, n_var, df_div, df_neut, df_div2, df_garud, sfs_pop1, jsfs, timing_df
+        return n_hap, n_var, df_div, df_neut, df_div2, df_garud, sfs_west, sfs_east, jsfs, timing_df
 
     # Compute from scratch
     import time
@@ -145,17 +146,18 @@ def load_and_compute():
     })
     print(f"  Windowed stats: {time.perf_counter()-t0:.1f}s", flush=True)
 
-    sfs_pop1 = sfs_mod.sfs(hm, population="west_africa")
+    sfs_west = sfs_mod.sfs(hm, population="west_africa")
+    sfs_east = sfs_mod.sfs(hm, population="east_africa")
     jsfs = sfs_mod.joint_sfs(hm, pop1="west_africa", pop2="east_africa")
 
-    _save_cache(df_div, df_neut, df_div2, df_garud, sfs_pop1, jsfs)
+    _save_cache(df_div, df_neut, df_div2, df_garud, sfs_west, sfs_east, jsfs)
 
     timing_df = pd.read_csv(os.path.join(CACHE_DIR, "ag1000g_workflow_timing.csv"))
 
-    return n_hap, n_var, df_div, df_neut, df_div2, df_garud, sfs_pop1, jsfs, timing_df
+    return n_hap, n_var, df_div, df_neut, df_div2, df_garud, sfs_west, sfs_east, jsfs, timing_df
 
 
-def make_figure(n_hap, n_var, df_div, df_neut, df_div2, df_garud, sfs_pop1, jsfs, timing_df):
+def make_figure(n_hap, n_var, df_div, df_neut, df_div2, df_garud, sfs_west, sfs_east, jsfs, timing_df):
     """Build the multi-panel genome scan figure."""
 
     pos_mb = df_div['start'].values / 1e6
@@ -210,12 +212,12 @@ def make_figure(n_hap, n_var, df_div, df_neut, df_div2, df_garud, sfs_pop1, jsfs
                    color='#27ae60')
 
     # Row 2: Tajima's D
-    add_scan_panel(df_div['tajimas_d'].values, "Tajima's D", "D",
+    add_scan_panel(df_div['tajimas_d'].values, "Tajima's D (West Africa)", "D",
                    color='#8e44ad', hline=0)
 
     # Row 3: Fay & Wu's H*
     add_scan_panel(df_neut['normalized_fay_wu_h'].values,
-                   "Fay & Wu's H*", "H*", color='#d35400', hline=0)
+                   "Fay & Wu's H* (West Africa)", "H*", color='#d35400', hline=0)
 
     # Row 4: Zeng E
     add_scan_panel(df_neut['zeng_e'].values, "Zeng's E (West Africa)", 'E',
@@ -256,19 +258,30 @@ def make_figure(n_hap, n_var, df_div, df_neut, df_div2, df_garud, sfs_pop1, jsfs
                       'Gste', ha='center', va='bottom', fontsize=7,
                       fontstyle='italic', color='#c0392b')
 
-    # --- Right column: SFS (rows 0-2) ---
-    ax_sfs = fig.add_subplot(gs[0:3, 1])
-    sfs_arr = sfs_pop1[1:-1]
-    n_show = min(40, len(sfs_arr))
-    ax_sfs.bar(range(1, n_show + 1), sfs_arr[:n_show], color='#2980b9',
-               edgecolor='none', width=0.8)
-    ax_sfs.set_xlabel('Derived allele count', fontsize=8)
-    ax_sfs.set_ylabel('Count', fontsize=8)
-    ax_sfs.set_title('SFS (West Africa)', fontsize=10, fontweight='bold', pad=6)
-    ax_sfs.tick_params(labelsize=7)
+    # --- Right column: SFS West (rows 0-1) ---
+    ax_sfs_w = fig.add_subplot(gs[0:2, 1])
+    sfs_w = sfs_west[1:-1]
+    n_show = min(40, len(sfs_w))
+    ax_sfs_w.bar(range(1, n_show + 1), sfs_w[:n_show], color='#2980b9',
+                 edgecolor='none', width=0.8)
+    ax_sfs_w.set_xlabel('Derived allele count', fontsize=7)
+    ax_sfs_w.set_ylabel('Count', fontsize=7)
+    ax_sfs_w.set_title('SFS (West Africa)', fontsize=9, fontweight='bold', pad=4)
+    ax_sfs_w.tick_params(labelsize=6)
 
-    # --- Right column: Joint SFS (rows 3-5) ---
-    ax_jsfs = fig.add_subplot(gs[3:6, 1])
+    # --- Right column: SFS East (rows 2-3) ---
+    ax_sfs_e = fig.add_subplot(gs[2:4, 1])
+    sfs_e = sfs_east[1:-1]
+    n_show_e = min(40, len(sfs_e))
+    ax_sfs_e.bar(range(1, n_show_e + 1), sfs_e[:n_show_e], color='#27ae60',
+                 edgecolor='none', width=0.8)
+    ax_sfs_e.set_xlabel('Derived allele count', fontsize=7)
+    ax_sfs_e.set_ylabel('Count', fontsize=7)
+    ax_sfs_e.set_title('SFS (East Africa)', fontsize=9, fontweight='bold', pad=4)
+    ax_sfs_e.tick_params(labelsize=6)
+
+    # --- Right column: Joint SFS (rows 4-5) ---
+    ax_jsfs = fig.add_subplot(gs[4:6, 1])
     jsfs_plot = np.log10(np.maximum(jsfs, 1))
     n1 = min(40, jsfs_plot.shape[0])
     n2 = min(40, jsfs_plot.shape[1])
