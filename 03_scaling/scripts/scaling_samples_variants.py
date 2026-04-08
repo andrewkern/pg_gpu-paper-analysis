@@ -2,6 +2,12 @@
 """
 Runtime scaling with sample size and variant count.
 
+Sample-size scaling uses synthetic random haplotypes (fixed n_variants=100K)
+to measure GPU throughput across 100 to 100K haplotypes.
+
+Variant-count scaling uses msprime simulations with increasing sequence
+length (fixed n_haplotypes=200) to get realistic LD structure.
+
 Produces:
   - tables/scaling_samples.csv
   - tables/scaling_variants.csv
@@ -24,10 +30,6 @@ from pg_gpu import HaplotypeMatrix, diversity, divergence, windowed_analysis
 OUT_DIR_FIG = "03_scaling/figures"
 OUT_DIR_TBL = "03_scaling/tables"
 
-N_POP = 10_000
-MU = 1e-8
-RECOMB = 1e-8
-
 
 def bench(fn, n_warmup=1, n_iter=3):
     """Time a function, return median wall-clock."""
@@ -45,65 +47,79 @@ def bench(fn, n_warmup=1, n_iter=3):
 
 
 def scaling_by_samples():
-    """Fix variant count ~1M, vary sample size."""
-    L = 5_000_000
-    sample_sizes = [50, 100, 200, 500, 1000, 1500, 2000]
+    """Fix variant count at 100K, vary sample size using synthetic data."""
+    n_var = 100_000
+    sample_sizes = [100, 200, 500, 1000, 2000, 5000, 10_000, 50_000, 100_000]
     rows = []
 
+    rng = np.random.default_rng(42)
+    pos = np.arange(n_var, dtype=np.int32) * 100
+
     for n_hap in sample_sizes:
-        print(f"  n_hap={n_hap}...", end='', flush=True)
-        ts = msprime.sim_ancestry(
-            samples=n_hap // 2, sequence_length=L,
-            recombination_rate=RECOMB, population_size=N_POP,
-            random_seed=42, ploidy=2)
-        ts = msprime.sim_mutations(ts, rate=MU, random_seed=42)
-        hm = HaplotypeMatrix.from_ts(ts)
-        n_half = n_hap // 2
-        hm.sample_sets = {
-            "pop1": list(range(n_half)),
-            "pop2": list(range(n_half, n_hap)),
-        }
-        hm.transfer_to_gpu()
-        cp.cuda.Stream.null.synchronize()
+        mem_gb = n_hap * n_var / 1e9
+        print(f"  n_hap={n_hap:>7,} ({mem_gb:.1f} GB)...", end='', flush=True)
 
-        n_var = hm.num_variants
-        print(f" {n_var:,} variants", flush=True)
+        try:
+            hap = rng.integers(0, 2, (n_hap, n_var), dtype=np.int8)
+            hm = HaplotypeMatrix(hap, pos.copy(), 0, n_var * 100)
+            n_half = n_hap // 2
+            hm.sample_sets = {
+                "pop1": list(range(n_half)),
+                "pop2": list(range(n_half, n_hap)),
+            }
+            del hap
+            hm.transfer_to_gpu()
+            cp.cuda.Stream.null.synchronize()
 
-        stats = {
-            'pi': lambda: diversity.pi(hm, population="pop1"),
-            'tajimas_d': lambda: diversity.tajimas_d(hm, population="pop1"),
-            'fst_hudson': lambda: divergence.fst_hudson(hm, "pop1", "pop2"),
-            'windowed_3': lambda: windowed_analysis(
-                hm, window_size=50_000,
-                statistics=['pi', 'theta_w', 'tajimas_d']),
-        }
+            stats = {
+                'pi': lambda: diversity.pi(hm, population="pop1"),
+                'tajimas_d': lambda: diversity.tajimas_d(hm, population="pop1"),
+                'fst_hudson': lambda: divergence.fst_hudson(hm, "pop1", "pop2"),
+            }
 
-        for stat_name, fn in stats.items():
-            t = bench(fn)
-            rows.append({
-                'n_haplotypes': n_hap,
-                'n_variants': n_var,
-                'statistic': stat_name,
-                'time_s': t,
-            })
-            print(f"    {stat_name}: {t:.4f}s", flush=True)
+            # Only run windowed for sizes where it won't be too slow
+            if n_hap <= 10_000:
+                stats['windowed_3'] = lambda: windowed_analysis(
+                    hm, window_size=500_000,
+                    statistics=['pi', 'theta_w', 'tajimas_d'])
+
+            for stat_name, fn in stats.items():
+                t = bench(fn)
+                rows.append({
+                    'n_haplotypes': n_hap,
+                    'n_variants': n_var,
+                    'statistic': stat_name,
+                    'time_s': t,
+                })
+
+            timings = " ".join(f"{r['statistic']}={r['time_s']:.3f}s"
+                               for r in rows if r['n_haplotypes'] == n_hap)
+            print(f" {timings}", flush=True)
+
+            del hm
+            cp.get_default_memory_pool().free_all_blocks()
+
+        except Exception as e:
+            print(f" FAILED: {e}", flush=True)
+            cp.get_default_memory_pool().free_all_blocks()
 
     return pd.DataFrame(rows)
 
 
 def scaling_by_variants():
-    """Fix sample size n=200, vary variant count via sequence length."""
+    """Fix sample size at n=200, vary variant count via msprime sequence length."""
     n_hap = 200
-    lengths = [100_000, 500_000, 1_000_000, 5_000_000, 10_000_000, 20_000_000]
+    # Longer sequences = more variants under neutral model
+    lengths = [100_000, 500_000, 2_000_000, 10_000_000, 50_000_000, 100_000_000]
     rows = []
 
     for L in lengths:
-        print(f"  L={L:,}...", end='', flush=True)
+        print(f"  L={L:>12,}...", end='', flush=True)
         ts = msprime.sim_ancestry(
             samples=n_hap // 2, sequence_length=L,
-            recombination_rate=RECOMB, population_size=N_POP,
+            recombination_rate=1e-8, population_size=10_000,
             random_seed=42, ploidy=2)
-        ts = msprime.sim_mutations(ts, rate=MU, random_seed=42)
+        ts = msprime.sim_mutations(ts, rate=1e-8, random_seed=42)
         hm = HaplotypeMatrix.from_ts(ts)
         n_half = n_hap // 2
         hm.sample_sets = {
@@ -114,7 +130,7 @@ def scaling_by_variants():
         cp.cuda.Stream.null.synchronize()
 
         n_var = hm.num_variants
-        print(f" {n_var:,} variants", flush=True)
+        print(f" {n_var:>8,} variants", end='', flush=True)
 
         stats = {
             'pi': lambda: diversity.pi(hm, population="pop1"),
@@ -133,7 +149,14 @@ def scaling_by_variants():
                 'statistic': stat_name,
                 'time_s': t,
             })
-            print(f"    {stat_name}: {t:.4f}s", flush=True)
+
+        timings = " ".join(f"{r['statistic']}={r['time_s']:.4f}s"
+                           for r in rows if r['n_haplotypes'] == n_hap
+                           and r['n_variants'] == n_var)
+        print(f"  {timings}", flush=True)
+
+        del hm
+        cp.get_default_memory_pool().free_all_blocks()
 
     return pd.DataFrame(rows)
 
@@ -142,9 +165,11 @@ def make_figure(df, x_col, x_label, outpath, title):
     sns.set_theme(style="whitegrid", context="paper", font_scale=1.1)
     fig, ax = plt.subplots(figsize=(6, 4))
 
+    markers = {'pi': 'o', 'tajimas_d': 's', 'fst_hudson': '^', 'windowed_3': 'D'}
     for stat in df['statistic'].unique():
-        sub = df[df['statistic'] == stat]
-        ax.plot(sub[x_col], sub['time_s'], 'o-', label=stat, markersize=5)
+        sub = df[df['statistic'] == stat].sort_values(x_col)
+        m = markers.get(stat, 'o')
+        ax.plot(sub[x_col], sub['time_s'], f'-{m}', label=stat, markersize=5)
 
     ax.set_xscale('log')
     ax.set_yscale('log')
@@ -158,20 +183,20 @@ def make_figure(df, x_col, x_label, outpath, title):
 
 
 def main():
-    print("Scaling by sample size:")
+    print("Scaling by sample size (100K variants, synthetic data):")
     df_samples = scaling_by_samples()
     df_samples.to_csv(f"{OUT_DIR_TBL}/scaling_samples.csv", index=False)
 
-    print("\nScaling by variant count:")
+    print("\nScaling by variant count (200 haplotypes, msprime):")
     df_variants = scaling_by_variants()
     df_variants.to_csv(f"{OUT_DIR_TBL}/scaling_variants.csv", index=False)
 
     make_figure(df_samples, 'n_haplotypes', 'Number of haplotypes',
                 f"{OUT_DIR_FIG}/scaling_samples.pdf",
-                'Runtime scaling with sample size')
+                'Runtime scaling with sample size (100K variants)')
     make_figure(df_variants, 'n_variants', 'Number of variants',
                 f"{OUT_DIR_FIG}/scaling_variants.pdf",
-                'Runtime scaling with variant count')
+                'Runtime scaling with variant count (200 haplotypes)')
 
 
 if __name__ == "__main__":
