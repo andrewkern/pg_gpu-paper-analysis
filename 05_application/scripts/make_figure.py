@@ -23,6 +23,7 @@ from pg_gpu import (
 OUT_DIR = "05_application/figures"
 CACHE_DIR = "05_application/tables"
 ZARR_PATH = "/sietch_colab/data_share/Ag1000G/Ag3.0/vcf/AgamP3.phased.zarr"
+MASK_BED = "/sietch_colab/data_share/Ag1000G/Ag3.0/args_trees/singer-test/3R.mask.bed"
 CHROM = "3R"
 N_DIP = 100
 WINDOW_SIZE = 100_000
@@ -100,11 +101,17 @@ def load_and_compute():
         "west_africa": pops["west_africa"],
         "east_africa": pops["east_africa"],
     }
+
+    # Attach accessibility mask — filters variants to accessible regions
+    # and uses accessible base count for per-base normalization
+    hm.set_accessible_mask(MASK_BED, chrom=CHROM)
+    n_accessible = hm.n_total_sites
     hm.transfer_to_gpu()
     cp.cuda.Stream.null.synchronize()
     n_hap = hm.num_haplotypes
     n_var = hm.num_variants
-    print(f"  {n_hap} haps x {n_var:,} variants", flush=True)
+    print(f"  {n_hap} haps x {n_var:,} variants "
+          f"({n_accessible:,} accessible bases)", flush=True)
 
     print("Computing windowed stats...", flush=True)
     t0 = time.perf_counter()
