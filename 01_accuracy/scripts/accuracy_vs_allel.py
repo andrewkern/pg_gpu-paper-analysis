@@ -184,14 +184,14 @@ def main():
     add_scalar("garud_h1", pg_h[0], al_h[0])
     add_scalar("garud_h12", pg_h[1], al_h[1])
 
-    # --- Windowed ---
+    # --- Windowed (population-subsetted for fair comparison) ---
     print("\nWindowed:", flush=True)
     ws, we = int(positions[0]), int(positions[-1])
     pg_w = windowed_analysis(hm, window_size=50_000,
-                             statistics=["pi", "theta_w", "tajimas_d"])
-    ac_all = g.count_alleles()
-    al_pi = allel.windowed_diversity(pos_allel, ac_all, size=50_000, start=ws, stop=we)[0]
-    al_tw = allel.windowed_watterson_theta(pos_allel, ac_all, size=50_000, start=ws, stop=we)[0]
+                             statistics=["pi", "theta_w", "tajimas_d"],
+                             populations=["pop1"])
+    al_pi = allel.windowed_diversity(pos_allel, ac1, size=50_000, start=ws, stop=we)[0]
+    al_tw = allel.windowed_watterson_theta(pos_allel, ac1, size=50_000, start=ws, stop=we)[0]
     add_array("windowed_pi", pg_w["pi"].values, al_pi)
     add_array("windowed_theta_w", pg_w["theta_w"].values, al_tw)
 
