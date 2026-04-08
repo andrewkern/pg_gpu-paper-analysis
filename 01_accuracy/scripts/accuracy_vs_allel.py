@@ -62,10 +62,10 @@ def build_allel(hm):
     ac1 = g.count_alleles(subpop=pop1_dip)
     ac2 = g.count_alleles(subpop=pop2_dip)
 
-    # Biallelic filter for admixture stats
-    is_biallelic = ac.max_allele() == 1
-    ac1_bi = ac1.compress(is_biallelic, axis=0)
-    ac2_bi = ac2.compress(is_biallelic, axis=0)
+    # Biallelic filter for admixture stats (allel requires exactly 2 allele columns)
+    is_biallelic = (ac.max_allele() == 1) & (ac.shape[1] >= 2)
+    ac1_bi = ac1.compress(is_biallelic, axis=0)[:, :2]
+    ac2_bi = ac2.compress(is_biallelic, axis=0)[:, :2]
 
     return g, pos, ac, ac1, ac2, ac1_bi, ac2_bi, pop1_dip, pop2_dip, is_biallelic
 
@@ -148,11 +148,12 @@ def main():
     results.append(compare_array("joint_sfs", pg.ravel(), al_j.ravel()))
 
     # --- Admixture (biallelic only for allel) ---
-    pg = admixture.patterson_f2(hm, "pop1", "pop2")
-    al_t, al_b = allel.patterson_f2(ac1_bi, ac2_bi)
-    al = np.nansum(al_t) / np.nansum(al_b)
-    # pg_gpu handles multiallelic internally; compare on overlapping sites
-    results.append(compare_scalar("patterson_f2", pg, al))
+    # pg_gpu returns per-variant F2 for all sites; allel only biallelic
+    pg_f2 = admixture.patterson_f2(hm, "pop1", "pop2")
+    al_f2 = allel.patterson_f2(ac1_bi, ac2_bi)
+    # Compare on biallelic sites only
+    pg_f2_bi = pg_f2[is_bi]
+    results.append(compare_array("patterson_f2", pg_f2_bi, al_f2))
 
     # --- Selection (per-variant arrays) ---
     pg_h1, pg_h12, pg_h123, pg_h2h1 = selection.garud_h(hm, population="pop1")
