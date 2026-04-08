@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import cupy as cp
 import zarr
+from scipy.ndimage import uniform_filter1d
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -175,10 +176,17 @@ def make_figure(n_hap, n_var, df_div, df_neut, df_div2, df_garud, sfs_pop1, jsfs
 
     panel_idx = 0
 
+    SMOOTH_SIZE = 5  # number of overlapping windows to average
+
     def add_scan_panel(y, label, ylabel, color='#2c3e50', alpha=0.6, hline=None):
         nonlocal panel_idx
         ax = fig.add_subplot(gs[panel_idx, 0])
-        ax.plot(pos_mb, y, color=color, alpha=alpha, linewidth=0.6)
+        # Raw trace (faded)
+        ax.plot(pos_mb, y, color=color, alpha=0.15, linewidth=0.4)
+        # Smoothed line
+        y_smooth = uniform_filter1d(np.where(np.isfinite(y), y, 0.0),
+                                    size=SMOOTH_SIZE, mode='nearest')
+        ax.plot(pos_mb, y_smooth, color=color, alpha=0.9, linewidth=0.8)
         ax.set_ylabel(ylabel, fontsize=9)
         ax.set_title(label, fontsize=10, fontweight='bold', loc='left', pad=2)
         ax.tick_params(labelsize=7)
@@ -224,8 +232,11 @@ def make_figure(n_hap, n_var, df_div, df_neut, df_div2, df_garud, sfs_pop1, jsfs
     # Row 7: Garud H12 (SNP-count windows — different x-axis)
     ax = fig.add_subplot(gs[panel_idx, 0])
     garud_pos_mb = df_garud['center'].values / 1e6
-    ax.plot(garud_pos_mb, df_garud['garud_h12'].values,
-            color='#e67e22', alpha=0.6, linewidth=0.6)
+    h12_vals = df_garud['garud_h12'].values
+    ax.plot(garud_pos_mb, h12_vals, color='#e67e22', alpha=0.15, linewidth=0.4)
+    h12_smooth = uniform_filter1d(np.where(np.isfinite(h12_vals), h12_vals, 0.0),
+                                  size=SMOOTH_SIZE, mode='nearest')
+    ax.plot(garud_pos_mb, h12_smooth, color='#e67e22', alpha=0.9, linewidth=0.8)
     ax.set_ylabel('H12', fontsize=9)
     ax.set_title("Garud's H12 (West Africa, 1000-SNP windows)", fontsize=10,
                  fontweight='bold', loc='left', pad=2)
