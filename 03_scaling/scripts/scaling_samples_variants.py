@@ -25,7 +25,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from pg_gpu import HaplotypeMatrix, diversity, divergence, windowed_analysis
+from pg_gpu import HaplotypeMatrix, diversity, divergence, selection, ld_statistics, windowed_analysis
 
 OUT_DIR_FIG = "03_scaling/figures"
 OUT_DIR_TBL = "03_scaling/tables"
@@ -71,10 +71,15 @@ def scaling_by_samples():
             hm.transfer_to_gpu()
             cp.cuda.Stream.null.synchronize()
 
+            # Use a smaller variant subset for ZnS (O(m^2))
+            hm_ld = hm.get_subset(np.arange(min(5000, n_var)))
+
             stats = {
                 'pi': lambda: diversity.pi(hm, population="pop1"),
                 'tajimas_d': lambda: diversity.tajimas_d(hm, population="pop1"),
                 'fst_hudson': lambda: divergence.fst_hudson(hm, "pop1", "pop2"),
+                'garud_h': lambda: selection.garud_h(hm),
+                'zns': lambda: ld_statistics.zns(hm_ld),
             }
 
             # Only run windowed for sizes where it won't be too slow
@@ -132,10 +137,15 @@ def scaling_by_variants():
         n_var = hm.num_variants
         print(f" {n_var:>8,} variants", end='', flush=True)
 
+        # ZnS subset (O(m^2), cap at 5K variants)
+        hm_ld = hm.get_subset(np.arange(min(5000, hm.num_variants)))
+
         stats = {
             'pi': lambda: diversity.pi(hm, population="pop1"),
             'tajimas_d': lambda: diversity.tajimas_d(hm, population="pop1"),
             'fst_hudson': lambda: divergence.fst_hudson(hm, "pop1", "pop2"),
+            'garud_h': lambda: selection.garud_h(hm),
+            'zns': lambda: ld_statistics.zns(hm_ld),
             'windowed_3': lambda: windowed_analysis(
                 hm, window_size=50_000,
                 statistics=['pi', 'theta_w', 'tajimas_d']),
@@ -165,7 +175,8 @@ def make_figure(df, x_col, x_label, outpath, title):
     sns.set_theme(style="whitegrid", context="paper", font_scale=1.1)
     fig, ax = plt.subplots(figsize=(6, 4))
 
-    markers = {'pi': 'o', 'tajimas_d': 's', 'fst_hudson': '^', 'windowed_3': 'D'}
+    markers = {'pi': 'o', 'tajimas_d': 's', 'fst_hudson': '^', 'windowed_3': 'D',
+                'garud_h': 'v', 'zns': 'P'}
     for stat in df['statistic'].unique():
         sub = df[df['statistic'] == stat].sort_values(x_col)
         m = markers.get(stat, 'o')
