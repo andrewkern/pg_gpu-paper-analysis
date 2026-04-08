@@ -90,10 +90,15 @@ def load_and_compute():
     hm = HaplotypeMatrix(haplotypes, positions,
                           chrom_start=int(positions[0]),
                           chrom_end=int(positions[-1]))
-    n_hap_per_pop = 2 * N_DIP
+
+    # Load biologically meaningful population assignments
+    import json
+    pop_path = os.path.join(CACHE_DIR, "population_assignments.json")
+    with open(pop_path) as f:
+        pops = json.load(f)
     hm.sample_sets = {
-        "pop1": list(range(0, n_hap_per_pop)),
-        "pop2": list(range(n_hap_per_pop, 2 * n_hap_per_pop)),
+        "west_africa": pops["west_africa"],
+        "east_africa": pops["east_africa"],
     }
     hm.transfer_to_gpu()
     cp.cuda.Stream.null.synchronize()
@@ -106,20 +111,20 @@ def load_and_compute():
     df_div = windowed_analysis(hm, window_size=WINDOW_SIZE,
         statistics=['pi', 'theta_w', 'tajimas_d', 'segregating_sites',
                     'singletons', 'max_daf'],
-        populations=['pop1'])
+        populations=['west_africa'])
     df_neut = windowed_analysis(hm, window_size=WINDOW_SIZE,
         statistics=['fay_wu_h', 'normalized_fay_wu_h', 'zeng_e'],
-        populations=['pop1'])
+        populations=['west_africa'])
     df_div2 = windowed_analysis(hm, window_size=WINDOW_SIZE,
         statistics=['fst', 'fst_wc', 'dxy', 'da'],
-        populations=['pop1', 'pop2'])
+        populations=['west_africa', 'east_africa'])
     df_garud = windowed_analysis(hm, window_size=WINDOW_SIZE,
         statistics=['garud_h1', 'garud_h12', 'garud_h123', 'garud_h2h1'],
-        populations=['pop1'])
+        populations=['west_africa'])
     print(f"  Windowed stats: {time.perf_counter()-t0:.1f}s", flush=True)
 
-    sfs_pop1 = sfs_mod.sfs(hm, population="pop1")
-    jsfs = sfs_mod.joint_sfs(hm, pop1="pop1", pop2="pop2")
+    sfs_pop1 = sfs_mod.sfs(hm, population="west_africa")
+    jsfs = sfs_mod.joint_sfs(hm, pop1="west_africa", pop2="east_africa")
 
     _save_cache(df_div, df_neut, df_div2, df_garud, sfs_pop1, jsfs)
 
@@ -178,19 +183,19 @@ def make_figure(n_hap, n_var, df_div, df_neut, df_div2, df_garud, sfs_pop1, jsfs
                    "Fay & Wu's H*", "H*", color='#d35400', hline=0)
 
     # Row 4: Zeng E
-    add_scan_panel(df_neut['zeng_e'].values, "Zeng's E (pop1)", 'E',
+    add_scan_panel(df_neut['zeng_e'].values, "Zeng's E (West Africa)", 'E',
                    color='#2c3e50', hline=0)
     
     # Row 5: Hudson FST
-    add_scan_panel(df_div2['fst'].values, r'Hudson $F_{ST}$ (pop1 vs pop2)',
+    add_scan_panel(df_div2['fst'].values, r'Hudson $F_{ST}$ (West vs East Africa)',
                    r'$F_{ST}$', color='#c0392b')
 
     # Row 6: Dxy
-    add_scan_panel(df_div2['dxy'].values, r'$D_{xy}$ (pop1 vs pop2)',
+    add_scan_panel(df_div2['dxy'].values, r'$D_{xy}$ (West vs East Africa)',
                    r'$D_{xy}$', color='#16a085')
 
     # Row 7: Garud H12
-    add_scan_panel(df_garud['garud_h12'].values, "Garud's H12 (pop1)", 'H12',
+    add_scan_panel(df_garud['garud_h12'].values, "Garud's H12 (West Africa)", 'H12',
                    color='#e67e22')
 
     # # Row 8: Segregating sites
@@ -205,7 +210,7 @@ def make_figure(n_hap, n_var, df_div, df_neut, df_div2, df_garud, sfs_pop1, jsfs
                edgecolor='none', width=0.8)
     ax_sfs.set_xlabel('Derived allele count', fontsize=8)
     ax_sfs.set_ylabel('Count', fontsize=8)
-    ax_sfs.set_title('SFS (pop1)', fontsize=10, fontweight='bold', pad=6)
+    ax_sfs.set_title('SFS (West Africa)', fontsize=10, fontweight='bold', pad=6)
     ax_sfs.tick_params(labelsize=7)
 
     # --- Right column: Joint SFS (rows 3-5) ---
@@ -215,8 +220,8 @@ def make_figure(n_hap, n_var, df_div, df_neut, df_div2, df_garud, sfs_pop1, jsfs
     n2 = min(40, jsfs_plot.shape[1])
     im = ax_jsfs.imshow(jsfs_plot[:n1, :n2].T, origin='lower', aspect='equal',
                          cmap='viridis', interpolation='nearest')
-    ax_jsfs.set_xlabel('pop1 DAC', fontsize=8)
-    ax_jsfs.set_ylabel('pop2 DAC', fontsize=8)
+    ax_jsfs.set_xlabel('West Africa DAC', fontsize=8)
+    ax_jsfs.set_ylabel('East Africa DAC', fontsize=8)
     ax_jsfs.set_title('Joint SFS (log10)', fontsize=10, fontweight='bold', pad=6)
     ax_jsfs.tick_params(labelsize=7)
     cb = plt.colorbar(im, ax=ax_jsfs, fraction=0.046, pad=0.04, shrink=0.8)
