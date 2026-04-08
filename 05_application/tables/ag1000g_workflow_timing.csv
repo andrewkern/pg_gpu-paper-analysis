@@ -1,0 +1,16 @@
+step,time_s
+load_data,102.97804999351501
+gpu_transfer,38.66063737869263
+"diversity (pi, theta_w, tajimas_d, theta_h, theta_l)",1.3877836717292666
+"neutrality tests (fay_wu_h, normalized_fay_wu_h, zeng_e)",0.9155492233112454
+"divergence (fst, fst_wc, dxy, da)",0.9417883828282356
+"garud_h (h1, h12, h123, h2h1)",39.470399216748774
+pi(pop1),0.14235223457217216
+pi(pop2),0.14209640119224787
+tajimas_d(pop1),0.14235577266663313
+"fst_hudson(pop1, pop2)",0.28914172761142254
+"dxy(pop1, pop2)",0.28198234364390373
+sfs(pop1),0.15065929666161537
+"joint_sfs(pop1, pop2)",0.2852973295375705
+TOTAL_COMPUTE,44.14940560050309
+TOTAL_WITH_IO,185.78809297271073

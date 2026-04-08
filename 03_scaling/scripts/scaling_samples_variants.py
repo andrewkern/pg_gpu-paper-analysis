@@ -89,19 +89,23 @@ def scaling_by_samples():
                     statistics=['pi', 'theta_w', 'tajimas_d'])
 
             for stat_name, fn in stats.items():
-                t = bench(fn)
-                rows.append({
-                    'n_haplotypes': n_hap,
-                    'n_variants': n_var,
-                    'statistic': stat_name,
-                    'time_s': t,
-                })
+                try:
+                    t = bench(fn)
+                    rows.append({
+                        'n_haplotypes': n_hap,
+                        'n_variants': n_var,
+                        'statistic': stat_name,
+                        'time_s': t,
+                    })
+                except Exception as e:
+                    print(f" {stat_name}=OOM", end='', flush=True)
+                    cp.get_default_memory_pool().free_all_blocks()
 
             timings = " ".join(f"{r['statistic']}={r['time_s']:.3f}s"
                                for r in rows if r['n_haplotypes'] == n_hap)
             print(f" {timings}", flush=True)
 
-            del hm
+            del hm, hm_ld
             cp.get_default_memory_pool().free_all_blocks()
 
         except Exception as e:

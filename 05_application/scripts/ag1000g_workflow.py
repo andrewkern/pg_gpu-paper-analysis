@@ -136,12 +136,20 @@ def main():
             populations=['pop1']),
         timings)
 
-    # --- nSL ---
-    df_nsl = timed("mean_nsl",
-        lambda: windowed_analysis(hm, window_size=WINDOW_SIZE,
-            statistics=['mean_nsl'],
-            populations=['pop1']),
-        timings)
+    # --- nSL (per-population subset to avoid OOM at full-arm scale) ---
+    hm_pop1 = hm.get_population_matrix("pop1") if hasattr(hm, 'get_population_matrix') else None
+    if hm_pop1 is None:
+        from pg_gpu._utils import get_population_matrix
+        hm_pop1 = get_population_matrix(hm, "pop1")
+    try:
+        df_nsl = timed("mean_nsl",
+            lambda: windowed_analysis(hm, window_size=WINDOW_SIZE,
+                statistics=['mean_nsl'],
+                populations=['pop1']),
+            timings)
+    except cp.cuda.memory.OutOfMemoryError:
+        print("  mean_nsl: OOM at full-arm scale, skipping", flush=True)
+        df_nsl = None
 
     # --- Scalar statistics ---
     print("\nScalar statistics:", flush=True)
@@ -237,10 +245,16 @@ def main():
     add_panel(df_garud['garud_h12'].values, "Garud's H12", 'H12',
               color='#e67e22')
 
-    # Row 7: Mean nSL
-    ax = add_panel(df_nsl['mean_nsl'].values, 'Mean nSL', 'nSL',
-                   color='#2c3e50')
-    ax.axhline(0, color='0.4', linewidth=0.5, linestyle='--')
+    # Row 7: Mean nSL (may be None if OOM)
+    if df_nsl is not None:
+        ax = add_panel(df_nsl['mean_nsl'].values, 'Mean nSL', 'nSL',
+                       color='#2c3e50')
+        ax.axhline(0, color='0.4', linewidth=0.5, linestyle='--')
+    else:
+        ax = add_panel(np.full(len(pos_mb), np.nan),
+                       'Mean nSL (skipped: OOM)', 'nSL', color='#bdc3c7')
+        ax.text(0.5, 0.5, 'OOM at full-arm scale', transform=ax.transAxes,
+                ha='center', va='center', fontsize=10, color='0.5')
 
     # Row 8: Segregating sites
     add_panel(df_div['segregating_sites'].values, 'Segregating sites per window',
