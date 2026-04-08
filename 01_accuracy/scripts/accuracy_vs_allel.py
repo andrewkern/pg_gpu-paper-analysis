@@ -68,20 +68,27 @@ def load():
 def main():
     hm, gt, positions, n_samples = load()
 
+    # Filter to biallelic sites so pg_gpu and allel operate on identical data
+    print("Filtering to biallelic sites...", flush=True)
+    hm = hm.apply_biallelic_filter()
+    hm.transfer_to_gpu()
+    cp.cuda.Stream.null.synchronize()
+    print(f"  {hm.num_variants:,} biallelic variants")
+
     pop1_dip = list(range(N_DIP))
     pop2_dip = list(range(N_DIP, 2 * N_DIP))
 
+    # Build allel objects from the same biallelic sites
     print("Building allel objects...", flush=True)
-    g = allel.GenotypeArray(gt)
+    g_full = allel.GenotypeArray(gt)
+    ac_full = g_full.count_alleles()
+    is_bi = ac_full.is_biallelic_01()
+    g = g_full.compress(is_bi, axis=0)
+    positions = positions[is_bi]
     pos_allel = allel.SortedIndex(positions)
     ac1 = g.count_alleles(subpop=pop1_dip)
     ac2 = g.count_alleles(subpop=pop2_dip)
-
-    # Biallelic subset for admixture
-    ac_all = g.count_alleles()
-    is_bi = ac_all.is_biallelic_01()
-    g_bi = g.compress(is_bi, axis=0)
-    print(f"  {np.sum(is_bi):,}/{len(is_bi):,} biallelic sites")
+    del g_full, ac_full
 
     # Haplotype subsets for selection scans
     h_allel = g.to_haplotypes()
@@ -162,12 +169,10 @@ def main():
     al_jsfs = allel.joint_sfs(ac1[:, 1], ac2[:, 1]).flatten().astype(float)
     add_array("joint_sfs", pg_jsfs, al_jsfs)
 
-    # --- Admixture (biallelic) ---
+    # --- Admixture (already biallelic) ---
     print("\nAdmixture:", flush=True)
     pg_f2 = admixture.patterson_f2(hm, "pop1", "pop2")
-    ac1_bi = g_bi.count_alleles(subpop=pop1_dip)
-    ac2_bi = g_bi.count_alleles(subpop=pop2_dip)
-    al_f2 = allel.patterson_f2(ac1_bi, ac2_bi)
+    al_f2 = allel.patterson_f2(ac1, ac2)
     add_scalar("patterson_f2 (mean)",
                np.nanmean(pg_f2),
                np.nanmean(al_f2))
@@ -184,6 +189,7 @@ def main():
     ws, we = int(positions[0]), int(positions[-1])
     pg_w = windowed_analysis(hm, window_size=50_000,
                              statistics=["pi", "theta_w", "tajimas_d"])
+    ac_all = g.count_alleles()
     al_pi = allel.windowed_diversity(pos_allel, ac_all, size=50_000, start=ws, stop=we)[0]
     al_tw = allel.windowed_watterson_theta(pos_allel, ac_all, size=50_000, start=ws, stop=we)[0]
     add_array("windowed_pi", pg_w["pi"].values, al_pi)
