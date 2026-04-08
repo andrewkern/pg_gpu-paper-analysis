@@ -72,6 +72,7 @@ def build_allel(hm):
 
 def compare_scalar(name, pg_val, al_val):
     """Compare two scalar values."""
+    pg_val, al_val = float(pg_val), float(al_val)
     if np.isnan(pg_val) and np.isnan(al_val):
         return {"statistic": name, "pg_gpu": pg_val, "allel": al_val,
                 "abs_error": 0.0, "rel_error": 0.0, "match": True}
@@ -107,11 +108,11 @@ def main():
     span = hm.get_span()
 
     pg = diversity.pi(hm, population="pop1")
-    al = allel.mean_pairwise_difference(ac1) / span
+    al = float(np.sum(allel.mean_pairwise_difference(ac1)) / span)
     results.append(compare_scalar("pi", pg, al))
 
     pg = diversity.theta_w(hm, population="pop1")
-    al = allel.watterson_theta(pos, ac1) / span
+    al = float(allel.watterson_theta(pos, ac1) / span)
     results.append(compare_scalar("theta_w", pg, al))
 
     pg = diversity.tajimas_d(hm, population="pop1")
@@ -121,16 +122,16 @@ def main():
     # --- Divergence ---
     pg = divergence.fst_hudson(hm, "pop1", "pop2")
     al_num, al_den = allel.hudson_fst(ac1, ac2)
-    al = np.nansum(al_num) / np.nansum(al_den)
+    al = float(np.nansum(al_num) / np.nansum(al_den))
     results.append(compare_scalar("fst_hudson", pg, al))
 
     pg = divergence.fst_weir_cockerham(hm, "pop1", "pop2")
     al_a, al_b, al_c = allel.weir_cockerham_fst(g, [pop1_dip, pop2_dip])
-    al = np.nansum(al_a) / (np.nansum(al_a) + np.nansum(al_b) + np.nansum(al_c))
+    al = float(np.nansum(al_a) / (np.nansum(al_a) + np.nansum(al_b) + np.nansum(al_c)))
     results.append(compare_scalar("fst_wc", pg, al))
 
     pg = divergence.dxy(hm, "pop1", "pop2")
-    al = allel.sequence_divergence(pos, ac1, ac2)
+    al = float(allel.sequence_divergence(pos, ac1, ac2))
     results.append(compare_scalar("dxy", pg, al))
 
     # --- SFS ---
