@@ -133,28 +133,28 @@ def make_figure(n_hap, n_var, df_div, df_neut, df_div2, df_garud, sfs_pop1, jsfs
 
     pos_mb = df_div['start'].values / 1e6
 
-    # --- Layout ---
+    # --- Layout: 8 rows, left=scan panels (wide), right=SFS/timing ---
+    n_rows = 8
     sns.set_theme(style="darkgrid", context="paper", font_scale=0.9)
-    fig = plt.figure(figsize=(18, 18))
+    fig = plt.figure(figsize=(18, 20))
 
-    # Left 3 cols: genome scan. Right col: SFS + joint SFS + timing
-    gs = GridSpec(9, 5, figure=fig, hspace=0.4, wspace=0.5,
-                  width_ratios=[3, 3, 3, 0.2, 1.8],
-                  left=0.05, right=0.96, top=0.94, bottom=0.04)
+    gs = GridSpec(n_rows, 2, figure=fig, hspace=0.35, wspace=0.25,
+                  width_ratios=[3, 1],
+                  left=0.06, right=0.96, top=0.95, bottom=0.04)
 
     panel_idx = 0
 
     def add_scan_panel(y, label, ylabel, color='#2c3e50', alpha=0.6, hline=None):
         nonlocal panel_idx
-        ax = fig.add_subplot(gs[panel_idx, 0:3])
+        ax = fig.add_subplot(gs[panel_idx, 0])
         ax.plot(pos_mb, y, color=color, alpha=alpha, linewidth=0.6)
-        ax.set_ylabel(ylabel, fontsize=8)
-        ax.set_title(label, fontsize=9, fontweight='bold', loc='left', pad=2)
+        ax.set_ylabel(ylabel, fontsize=9)
+        ax.set_title(label, fontsize=10, fontweight='bold', loc='left', pad=2)
         ax.tick_params(labelsize=7)
         ax.set_xlim(pos_mb[0], pos_mb[-1])
         if hline is not None:
             ax.axhline(hline, color='0.5', linewidth=0.5, linestyle='--')
-        if panel_idx < 8:
+        if panel_idx < n_rows - 1:
             ax.set_xticklabels([])
         else:
             ax.set_xlabel(f'{CHROM} position (Mb)', fontsize=9)
@@ -197,36 +197,35 @@ def make_figure(n_hap, n_var, df_div, df_neut, df_div2, df_garud, sfs_pop1, jsfs
     # add_scan_panel(df_div['segregating_sites'].values, 'Segregating sites per window',
     #                'S', color='#7f8c8d')
 
-    # --- Right column: SFS ---
-    ax_sfs = fig.add_subplot(gs[0:3, 4])
+    # --- Right column: SFS (rows 0-2) ---
+    ax_sfs = fig.add_subplot(gs[0:3, 1])
     sfs_arr = sfs_pop1[1:-1]
     n_show = min(40, len(sfs_arr))
     ax_sfs.bar(range(1, n_show + 1), sfs_arr[:n_show], color='#2980b9',
                edgecolor='none', width=0.8)
-    ax_sfs.set_xlabel('Derived allele count', fontsize=7)
-    ax_sfs.set_ylabel('Count', fontsize=7)
-    ax_sfs.set_title('SFS (pop1)', fontsize=9, fontweight='bold', pad=6)
-    ax_sfs.tick_params(labelsize=6)
+    ax_sfs.set_xlabel('Derived allele count', fontsize=8)
+    ax_sfs.set_ylabel('Count', fontsize=8)
+    ax_sfs.set_title('SFS (pop1)', fontsize=10, fontweight='bold', pad=6)
+    ax_sfs.tick_params(labelsize=7)
 
-    # --- Right column: Joint SFS ---
-    ax_jsfs = fig.add_subplot(gs[3:6, 4])
+    # --- Right column: Joint SFS (rows 3-5) ---
+    ax_jsfs = fig.add_subplot(gs[3:6, 1])
     jsfs_plot = np.log10(np.maximum(jsfs, 1))
     n1 = min(40, jsfs_plot.shape[0])
     n2 = min(40, jsfs_plot.shape[1])
-    im = ax_jsfs.imshow(jsfs_plot[:n1, :n2].T, origin='lower', aspect='auto',
+    im = ax_jsfs.imshow(jsfs_plot[:n1, :n2].T, origin='lower', aspect='equal',
                          cmap='viridis', interpolation='nearest')
-    ax_jsfs.set_xlabel('pop1 DAC', fontsize=7)
-    ax_jsfs.set_ylabel('pop2 DAC', fontsize=7)
-    ax_jsfs.set_title('Joint SFS (log10)', fontsize=9, fontweight='bold', pad=6)
-    ax_jsfs.tick_params(labelsize=6)
-    cb = plt.colorbar(im, ax=ax_jsfs, fraction=0.046, pad=0.04, shrink=0.9)
-    cb.ax.tick_params(labelsize=5)
+    ax_jsfs.set_xlabel('pop1 DAC', fontsize=8)
+    ax_jsfs.set_ylabel('pop2 DAC', fontsize=8)
+    ax_jsfs.set_title('Joint SFS (log10)', fontsize=10, fontweight='bold', pad=6)
+    ax_jsfs.tick_params(labelsize=7)
+    cb = plt.colorbar(im, ax=ax_jsfs, fraction=0.046, pad=0.04, shrink=0.8)
+    cb.ax.tick_params(labelsize=6)
 
-    # --- Right column: Timing ---
-    ax_time = fig.add_subplot(gs[6:9, 4])
+    # --- Right column: Timing (rows 6-7) ---
+    ax_time = fig.add_subplot(gs[6:8, 1])
     compute_rows = timing_df[~timing_df['step'].isin(
         ['load_data', 'gpu_transfer', 'TOTAL_COMPUTE', 'TOTAL_WITH_IO'])]
-    # Shorter labels
     label_map = {
         'diversity (pi, theta_w, tajimas_d, theta_h, theta_l)': 'diversity (5 stats)',
         'neutrality tests (fay_wu_h, normalized_fay_wu_h, zeng_e)': 'neutrality (3 tests)',
@@ -240,12 +239,12 @@ def make_figure(n_hap, n_var, df_div, df_neut, df_div2, df_garud, sfs_pop1, jsfs
     ax_time.barh(range(len(names)), times, color=colors_bar,
                  edgecolor='0.3', linewidth=0.5)
     ax_time.set_yticks(range(len(names)))
-    ax_time.set_yticklabels(names, fontsize=6)
+    ax_time.set_yticklabels(names, fontsize=7)
     ax_time.set_xscale('log')
-    ax_time.set_xlabel('Time (seconds)', fontsize=7)
-    ax_time.set_title(f'Compute time ({total:.1f}s total)', fontsize=9,
+    ax_time.set_xlabel('Time (seconds)', fontsize=8)
+    ax_time.set_title(f'Compute time ({total:.1f}s total)', fontsize=10,
                       fontweight='bold', pad=6)
-    ax_time.tick_params(labelsize=6)
+    ax_time.tick_params(labelsize=7)
     ax_time.invert_yaxis()
 
     # --- Title ---
