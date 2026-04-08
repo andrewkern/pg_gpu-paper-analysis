@@ -125,9 +125,22 @@ def load_and_compute():
     df_div2 = windowed_analysis(hm, window_size=WINDOW_SIZE,
         statistics=['fst', 'fst_wc', 'dxy', 'da'],
         populations=['west_africa', 'east_africa'])
-    df_garud = windowed_analysis(hm, window_size=WINDOW_SIZE,
-        statistics=['garud_h1', 'garud_h12', 'garud_h123', 'garud_h2h1'],
-        populations=['west_africa'])
+    # Garud H: use SNP-count windows (matches Miles et al. 2017)
+    h1, h12, h123, h2h1 = selection.moving_garud_h(
+        hm, population='west_africa', size=1000, step=200)
+    # Compute window center positions
+    pos_cpu = hm.positions
+    if hasattr(pos_cpu, 'get'):
+        pos_cpu = pos_cpu.get()
+    garud_centers = []
+    for w_start in range(0, len(pos_cpu) - 1000 + 1, 200):
+        garud_centers.append((pos_cpu[w_start] + pos_cpu[w_start + 999]) / 2)
+    garud_centers = np.array(garud_centers)
+    df_garud = pd.DataFrame({
+        'center': garud_centers[:len(h12)],
+        'garud_h1': h1, 'garud_h12': h12,
+        'garud_h123': h123, 'garud_h2h1': h2h1,
+    })
     print(f"  Windowed stats: {time.perf_counter()-t0:.1f}s", flush=True)
 
     sfs_pop1 = sfs_mod.sfs(hm, population="west_africa")
@@ -201,9 +214,18 @@ def make_figure(n_hap, n_var, df_div, df_neut, df_div2, df_garud, sfs_pop1, jsfs
     add_scan_panel(df_div2['dxy'].values, r'$D_{xy}$ (West vs East Africa)',
                    r'$D_{xy}$', color='#16a085')
 
-    # Row 7: Garud H12
-    add_scan_panel(df_garud['garud_h12'].values, "Garud's H12 (West Africa)", 'H12',
-                   color='#e67e22')
+    # Row 7: Garud H12 (SNP-count windows — different x-axis)
+    ax = fig.add_subplot(gs[panel_idx, 0])
+    garud_pos_mb = df_garud['center'].values / 1e6
+    ax.plot(garud_pos_mb, df_garud['garud_h12'].values,
+            color='#e67e22', alpha=0.6, linewidth=0.6)
+    ax.set_ylabel('H12', fontsize=9)
+    ax.set_title("Garud's H12 (West Africa, 1000-SNP windows)", fontsize=10,
+                 fontweight='bold', loc='left', pad=2)
+    ax.tick_params(labelsize=7)
+    ax.set_xlim(pos_mb[0], pos_mb[-1])
+    ax.set_xlabel(f'{CHROM} position (Mb)', fontsize=9)
+    panel_idx += 1
 
     # # Row 8: Segregating sites
     # add_scan_panel(df_div['segregating_sites'].values, 'Segregating sites per window',
