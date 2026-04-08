@@ -32,9 +32,11 @@ OUT_DIR_FIG = "05_application/figures"
 OUT_DIR_TBL = "05_application/tables"
 
 ZARR_PATH = "/sietch_colab/data_share/Ag1000G/Ag3.0/vcf/AgamP3.phased.zarr"
+MASK_BED = "/sietch_colab/data_share/Ag1000G/Ag3.0/args_trees/singer-test/3R.mask.bed"
 CHROM = "3R"
 N_DIP_PER_POP = 100
 WINDOW_SIZE = 100_000
+STEP_SIZE = 10_000
 
 
 def load_data():
@@ -59,17 +61,22 @@ def load_data():
         chrom_start=int(positions[0]),
         chrom_end=int(positions[-1]))
 
-    n_hap = 2 * N_DIP_PER_POP
+    # Load biologically meaningful population assignments
+    import json
+    pop_path = "05_application/tables/population_assignments.json"
+    with open(pop_path) as f:
+        pops = json.load(f)
     hm.sample_sets = {
-        "pop1": list(range(0, n_hap)),
-        "pop2": list(range(n_hap, 2 * n_hap)),
-        "pop3": list(range(2 * n_hap, 3 * n_hap)),
+        "west_africa": pops["west_africa"],
+        "east_africa": pops["east_africa"],
     }
 
+    # Attach accessibility mask
+    hm.set_accessible_mask(MASK_BED, chrom=CHROM)
+
     t_load = time.time() - t0
-    pct_miss = 100 * np.sum(haplotypes < 0) / haplotypes.size
     print(f"  {hm.num_haplotypes} haplotypes x {hm.num_variants:,} variants "
-          f"({pct_miss:.1f}% missing, {t_load:.0f}s)")
+          f"({hm.n_total_sites:,} accessible bases, {t_load:.0f}s)")
     return hm, t_load
 
 
@@ -99,7 +106,7 @@ def main():
     print(f"  {t_xfer:.1f}s", flush=True)
 
     # Warmup
-    _ = diversity.pi(hm, population="pop1")
+    _ = diversity.pi(hm, population="west_africa")
     cp.cuda.Stream.null.synchronize()
 
     # =========================================================================
@@ -109,43 +116,43 @@ def main():
 
     # --- Single-population diversity ---
     df_div = timed("diversity (pi, theta_w, tajimas_d, theta_h, theta_l)",
-        lambda: windowed_analysis(hm, window_size=WINDOW_SIZE,
+        lambda: windowed_analysis(hm, window_size=WINDOW_SIZE, step_size=STEP_SIZE,
             statistics=['pi', 'theta_w', 'tajimas_d', 'theta_h', 'theta_l',
                         'segregating_sites', 'singletons', 'max_daf'],
-            populations=['pop1']),
+            populations=['west_africa']),
         timings)
 
     # --- Neutrality tests ---
     df_neut = timed("neutrality tests (fay_wu_h, normalized_fay_wu_h, zeng_e)",
-        lambda: windowed_analysis(hm, window_size=WINDOW_SIZE,
+        lambda: windowed_analysis(hm, window_size=WINDOW_SIZE, step_size=STEP_SIZE,
             statistics=['fay_wu_h', 'normalized_fay_wu_h', 'zeng_e'],
-            populations=['pop1']),
+            populations=['west_africa']),
         timings)
 
     # --- Two-population divergence ---
     df_div2 = timed("divergence (fst, fst_wc, dxy, da)",
-        lambda: windowed_analysis(hm, window_size=WINDOW_SIZE,
+        lambda: windowed_analysis(hm, window_size=WINDOW_SIZE, step_size=STEP_SIZE,
             statistics=['fst', 'fst_wc', 'dxy', 'da'],
-            populations=['pop1', 'pop2']),
+            populations=['west_africa', 'east_africa']),
         timings)
 
     # --- Garud's H ---
     df_garud = timed("garud_h (h1, h12, h123, h2h1)",
-        lambda: windowed_analysis(hm, window_size=WINDOW_SIZE,
+        lambda: windowed_analysis(hm, window_size=WINDOW_SIZE, step_size=STEP_SIZE,
             statistics=['garud_h1', 'garud_h12', 'garud_h123', 'garud_h2h1'],
-            populations=['pop1']),
+            populations=['west_africa']),
         timings)
 
     # --- nSL (per-population subset to avoid OOM at full-arm scale) ---
-    hm_pop1 = hm.get_population_matrix("pop1") if hasattr(hm, 'get_population_matrix') else None
+    hm_pop1 = hm.get_population_matrix("west_africa") if hasattr(hm, 'get_population_matrix') else None
     if hm_pop1 is None:
         from pg_gpu._utils import get_population_matrix
-        hm_pop1 = get_population_matrix(hm, "pop1")
+        hm_pop1 = get_population_matrix(hm, "west_africa")
     try:
         df_nsl = timed("mean_nsl",
-            lambda: windowed_analysis(hm, window_size=WINDOW_SIZE,
+            lambda: windowed_analysis(hm, window_size=WINDOW_SIZE, step_size=STEP_SIZE,
                 statistics=['mean_nsl'],
-                populations=['pop1']),
+                populations=['west_africa']),
             timings)
     except cp.cuda.memory.OutOfMemoryError:
         print("  mean_nsl: OOM at full-arm scale, skipping", flush=True)
@@ -155,22 +162,22 @@ def main():
     print("\nScalar statistics:", flush=True)
     scalar = {}
     scalar['pi_pop1'] = timed("pi(pop1)",
-        lambda: diversity.pi(hm, population="pop1"), timings)
+        lambda: diversity.pi(hm, population="west_africa"), timings)
     scalar['pi_pop2'] = timed("pi(pop2)",
-        lambda: diversity.pi(hm, population="pop2"), timings)
+        lambda: diversity.pi(hm, population="east_africa"), timings)
     scalar['tajd_pop1'] = timed("tajimas_d(pop1)",
-        lambda: diversity.tajimas_d(hm, population="pop1"), timings)
+        lambda: diversity.tajimas_d(hm, population="west_africa"), timings)
     scalar['fst'] = timed("fst_hudson(pop1, pop2)",
-        lambda: divergence.fst_hudson(hm, "pop1", "pop2"), timings)
+        lambda: divergence.fst_hudson(hm, "west_africa", "east_africa"), timings)
     scalar['dxy'] = timed("dxy(pop1, pop2)",
-        lambda: divergence.dxy(hm, "pop1", "pop2"), timings)
+        lambda: divergence.dxy(hm, "west_africa", "east_africa"), timings)
 
     # --- SFS ---
     print("\nSFS:", flush=True)
     sfs_pop1 = timed("sfs(pop1)",
-        lambda: sfs.sfs(hm, population="pop1"), timings)
+        lambda: sfs.sfs(hm, population="west_africa"), timings)
     jsfs = timed("joint_sfs(pop1, pop2)",
-        lambda: sfs.joint_sfs(hm, pop1="pop1", pop2="pop2"), timings)
+        lambda: sfs.joint_sfs(hm, pop1="west_africa", pop2="east_africa"), timings)
 
     # --- Total ---
     total_compute = sum(t["time_s"] for t in timings
