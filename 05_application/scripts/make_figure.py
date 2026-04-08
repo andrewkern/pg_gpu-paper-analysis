@@ -27,6 +27,7 @@ MASK_BED = "/sietch_colab/data_share/Ag1000G/Ag3.0/args_trees/singer-test/3R.mas
 CHROM = "3R"
 N_DIP = 100
 WINDOW_SIZE = 100_000
+STEP_SIZE = 10_000
 
 
 def _cache_path(name):
@@ -115,14 +116,14 @@ def load_and_compute():
 
     print("Computing windowed stats...", flush=True)
     t0 = time.perf_counter()
-    df_div = windowed_analysis(hm, window_size=WINDOW_SIZE,
+    df_div = windowed_analysis(hm, window_size=WINDOW_SIZE, step_size=STEP_SIZE,
         statistics=['pi', 'theta_w', 'tajimas_d', 'segregating_sites',
                     'singletons', 'max_daf'],
         populations=['west_africa'])
-    df_neut = windowed_analysis(hm, window_size=WINDOW_SIZE,
+    df_neut = windowed_analysis(hm, window_size=WINDOW_SIZE, step_size=STEP_SIZE,
         statistics=['fay_wu_h', 'normalized_fay_wu_h', 'zeng_e'],
         populations=['west_africa'])
-    df_div2 = windowed_analysis(hm, window_size=WINDOW_SIZE,
+    df_div2 = windowed_analysis(hm, window_size=WINDOW_SIZE, step_size=STEP_SIZE,
         statistics=['fst', 'fst_wc', 'dxy', 'da'],
         populations=['west_africa', 'east_africa'])
     # Garud H: use SNP-count windows (matches Miles et al. 2017)
@@ -297,7 +298,7 @@ def make_figure(n_hap, n_var, df_div, df_neut, df_div2, df_garud, sfs_pop1, jsfs
     # --- Title ---
     fig.suptitle(f'Ag1000G {CHROM} genome scan\n'
                  f'{n_hap} haplotypes, {n_var:,} variants, '
-                 f'{WINDOW_SIZE//1000}kb windows',
+                 f'{WINDOW_SIZE//1000}kb windows, {STEP_SIZE//1000}kb step',
                  fontsize=11, fontweight='bold')
 
     fig.savefig(f"{OUT_DIR}/ag1000g_genome_scan.pdf",
