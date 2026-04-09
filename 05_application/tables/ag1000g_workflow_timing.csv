@@ -1,17 +1,17 @@
 step,time_s
-load_data,101.50869846343994
-gpu_transfer,49.52698230743408
-"diversity (pi, theta_w, tajimas_d, theta_h, theta_l)",0.07290638610720634
-"neutrality tests (fay_wu_h, normalized_fay_wu_h, zeng_e)",0.02949502505362034
-"divergence (fst, fst_wc, dxy, da)",0.21399582363665104
-"garud_h (h1, h12, h123, h2h1)",1.415751727297902
-mean_nsl,103.07332444377244
-pi(pop1),0.0018695499747991562
-pi(pop2),0.0017058709636330605
-tajimas_d(pop1),0.00197693333029747
-"fst_hudson(pop1, pop2)",0.005713249556720257
-"dxy(pop1, pop2)",0.0034427717328071594
-sfs(pop1),0.0026575177907943726
-"joint_sfs(pop1, pop2)",0.0036861812695860863
-TOTAL_COMPUTE,104.82652548048645
-TOTAL_WITH_IO,255.86220625136048
+load_data,114.56441879272461
+gpu_transfer,44.58681297302246
+"diversity (pi, theta_w, tajimas_d, theta_h, theta_l)",0.09026756417006254
+"neutrality tests (fay_wu_h, normalized_fay_wu_h, zeng_e)",0.04232217185199261
+"divergence (fst, fst_wc, dxy, da)",0.21337918005883694
+"garud_h (h1, h12, h123, h2h1)",1.320945167914033
+mean_nsl,113.7123168585822
+pi(pop1),0.002627299167215824
+pi(pop2),0.0022115353494882584
+tajimas_d(pop1),0.002670781686902046
+"fst_hudson(pop1, pop2)",0.008928067050874233
+"dxy(pop1, pop2)",0.004499135538935661
+sfs(pop1),0.0036828266456723213
+"joint_sfs(pop1, pop2)",0.004771688021719456
+TOTAL_COMPUTE,115.40862227603793
+TOTAL_WITH_IO,274.559854041785
