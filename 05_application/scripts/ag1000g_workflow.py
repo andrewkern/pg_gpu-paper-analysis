@@ -27,12 +27,16 @@ from pg_gpu import (
     HaplotypeMatrix, diversity, divergence, selection, sfs,
     windowed_analysis, ld_statistics, distance_stats,
 )
+from pg_gpu.accessible import AccessibleMask
 
 OUT_DIR_FIG = "05_application/figures"
 OUT_DIR_TBL = "05_application/tables"
 
 ZARR_PATH = "/sietch_colab/data_share/Ag1000G/Ag3.0/vcf/AgamP3.phased.zarr"
-MASK_BED = "/sietch_colab/data_share/Ag1000G/Ag3.0/args_trees/singer-test/3R.mask.bed"
+# Canonical accessibility bitmask (boolean ndarray, 1-based offset).
+# The sibling singer-test/*.mask.bed files are the inaccessible complement of
+# this array and have inverted polarity -- do not use them as accessibility input.
+MASK_NPZ = "/sietch_colab/data_share/Ag1000G/Ag3.0/args_trees/singer/agp3.is_accessible.txt.npz"
 CHROM = "3R"
 N_DIP_PER_POP = 100
 WINDOW_SIZE = 100_000
@@ -71,8 +75,10 @@ def load_data():
         "east_africa": pops["east_africa"],
     }
 
-    # Attach accessibility mask
-    hm.set_accessible_mask(MASK_BED, chrom=CHROM)
+    # Attach accessibility mask from the canonical bitmask npz (offset=1
+    # because mask[0] represents 1-based position 1).
+    acc_arr = np.load(MASK_NPZ)[f"access_{CHROM}"]
+    hm.set_accessible_mask(AccessibleMask(acc_arr, offset=1))
 
     t_load = time.time() - t0
     print(f"  {hm.num_haplotypes} haplotypes x {hm.num_variants:,} variants "
