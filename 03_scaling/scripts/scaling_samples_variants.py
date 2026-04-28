@@ -173,43 +173,62 @@ def scaling_by_variants():
     return pd.DataFrame(rows)
 
 
-def make_figure(df, x_col, x_label, outpath, title):
-    sns.set_theme(style="whitegrid", context="paper", font_scale=1.1)
-    fig, ax = plt.subplots(figsize=(6, 4))
+_MARKERS = {'pi': 'o', 'tajimas_d': 's', 'fst_hudson': '^', 'windowed_3': 'D',
+             'garud_h': 'v', 'zns': 'P'}
 
-    markers = {'pi': 'o', 'tajimas_d': 's', 'fst_hudson': '^', 'windowed_3': 'D',
-                'garud_h': 'v', 'zns': 'P'}
+
+def _draw_panel(ax, df, x_col, x_label, title, show_legend):
     for stat in df['statistic'].unique():
         sub = df[df['statistic'] == stat].sort_values(x_col)
-        m = markers.get(stat, 'o')
+        m = _MARKERS.get(stat, 'o')
         ax.plot(sub[x_col], sub['time_s'], f'-{m}', label=stat, markersize=5)
-
     ax.set_xscale('log')
     ax.set_yscale('log')
     ax.set_xlabel(x_label)
-    ax.set_ylabel('Wall-clock time (seconds)')
     ax.set_title(title)
-    ax.legend(fontsize=9)
+    if show_legend:
+        ax.legend(fontsize=9)
+
+
+def make_combined_figure(df_samples, df_variants, outpath):
+    """Two-panel scaling figure: left=samples, right=variants."""
+    sns.set_theme(style="whitegrid", context="paper", font_scale=1.1)
+    fig, (ax_s, ax_v) = plt.subplots(1, 2, figsize=(12, 4.5),
+                                       sharey=True)
+    _draw_panel(ax_s, df_samples, 'n_haplotypes',
+                'Number of haplotypes',
+                'Scaling with sample size (100K variants)',
+                show_legend=False)
+    _draw_panel(ax_v, df_variants, 'n_variants',
+                'Number of variants',
+                'Scaling with variant count (200 haplotypes)',
+                show_legend=True)
+    ax_s.set_ylabel('Wall-clock time (seconds)')
     plt.tight_layout()
     fig.savefig(outpath, bbox_inches='tight')
     print(f"Figure saved to {outpath}")
 
 
 def main():
-    print("Scaling by sample size (100K variants, synthetic data):")
-    df_samples = scaling_by_samples()
-    df_samples.to_csv(f"{OUT_DIR_TBL}/scaling_samples.csv", index=False)
+    import os
+    samples_csv = f"{OUT_DIR_TBL}/scaling_samples.csv"
+    variants_csv = f"{OUT_DIR_TBL}/scaling_variants.csv"
 
-    print("\nScaling by variant count (200 haplotypes, msprime):")
-    df_variants = scaling_by_variants()
-    df_variants.to_csv(f"{OUT_DIR_TBL}/scaling_variants.csv", index=False)
+    if os.path.exists(samples_csv) and os.path.exists(variants_csv):
+        print("Found existing CSVs; regenerating figure only.")
+        df_samples = pd.read_csv(samples_csv)
+        df_variants = pd.read_csv(variants_csv)
+    else:
+        print("Scaling by sample size (100K variants, synthetic data):")
+        df_samples = scaling_by_samples()
+        df_samples.to_csv(samples_csv, index=False)
 
-    make_figure(df_samples, 'n_haplotypes', 'Number of haplotypes',
-                f"{OUT_DIR_FIG}/scaling_samples.pdf",
-                'Runtime scaling with sample size (100K variants)')
-    make_figure(df_variants, 'n_variants', 'Number of variants',
-                f"{OUT_DIR_FIG}/scaling_variants.pdf",
-                'Runtime scaling with variant count (200 haplotypes)')
+        print("\nScaling by variant count (200 haplotypes, msprime):")
+        df_variants = scaling_by_variants()
+        df_variants.to_csv(variants_csv, index=False)
+
+    make_combined_figure(df_samples, df_variants,
+                         f"{OUT_DIR_FIG}/scaling_combined.pdf")
 
 
 if __name__ == "__main__":
