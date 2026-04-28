@@ -82,11 +82,9 @@ def scaling_by_samples():
                 'zns': lambda: ld_statistics.zns(hm_ld),
             }
 
-            # Only run windowed for sizes where it won't be too slow
-            if n_hap <= 10_000:
-                stats['windowed_3'] = lambda: windowed_analysis(
-                    hm, window_size=500_000,
-                    statistics=['pi', 'theta_w', 'tajimas_d'])
+            stats['windowed_3'] = lambda: windowed_analysis(
+                hm, window_size=500_000,
+                statistics=['pi', 'theta_w', 'tajimas_d'])
 
             for stat_name, fn in stats.items():
                 try:
