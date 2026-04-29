@@ -1,15 +1,17 @@
 #!/usr/bin/env python
 """
-Local PCA / lostruct on Ag1000G Phase 3 chromosome 3R.
+Local PCA / lostruct on Ag1000G Phase 3 chromosome 3R, West Africa subset.
 
-Runs the four-step Li & Ralph (2019) pipeline on the full 3R arm
-across all 2,940 phased haplotypes: per-window local PCA, Frobenius
-distance between window covariance representations, classical MDS,
-and corner detection in MDS space. A 1D k-means partitions windows
-into baseline / intermediate / outlier regimes by MDS1 distance from
-the chromosome-wide median, identifying genomic intervals whose
-local sample structure deviates most from the genome-wide pattern
-(e.g. inversions, large segregating SVs, or recent sweeps).
+Runs the four-step Li & Ralph (2019) pipeline on the same West African
+subset (200 phased haplotypes, 100 diploid individuals) used by the
+companion genome-scan workflow in ag1000g_workflow.py: per-window local
+PCA, Frobenius distance between window covariance representations,
+classical MDS, and corner detection in MDS space. A 1D k-means
+partitions windows into baseline / intermediate / outlier regimes by
+MDS1 distance from the chromosome-wide median, identifying genomic
+intervals whose local sample structure deviates most from the
+genome-wide pattern (e.g. inversions, large segregating SVs, or recent
+sweeps).
 
 Produces:
   - tables/ag1000g_lostruct_windows.csv
@@ -37,6 +39,8 @@ OUT_DIR_TBL = "05_application/tables"
 
 ZARR_PATH = "/sietch_colab/data_share/Ag1000G/Ag3.0/vcf/AgamP3.phased.zarr"
 MASK_NPZ = "/sietch_colab/data_share/Ag1000G/Ag3.0/args_trees/singer/agp3.is_accessible.txt.npz"
+POP_JSON = "05_application/tables/population_assignments.json"
+POPULATION = "west_africa"
 CHROM = "3R"
 # Canonical Li and Ralph (2019) lostruct uses fixed-SNP-count windows
 # so each window has constant statistical power for the local PCA. The
@@ -66,7 +70,8 @@ REGIME_COLORS = {"baseline": "#4C9AFF",
 
 
 def load_data():
-    """Load full 3R arm and attach the canonical accessibility mask."""
+    """Load full 3R arm, attach accessibility mask, and tag sample sets."""
+    import json
     print(f"Loading {CHROM} from Ag1000G...", flush=True)
     t0 = time.time()
     store = zarr.open_group(ZARR_PATH, mode='r')
@@ -86,13 +91,21 @@ def load_data():
         chrom_start=int(positions[0]),
         chrom_end=int(positions[-1]))
 
+    with open(POP_JSON) as f:
+        pops = json.load(f)
+    hm.sample_sets = {
+        "west_africa": pops["west_africa"],
+        "east_africa": pops["east_africa"],
+    }
+
     acc_arr = np.load(MASK_NPZ)[f"access_{CHROM}"]
     hm.set_accessible_mask(AccessibleMask(acc_arr, offset=1))
 
     t_load = time.time() - t0
-    print(f"  {hm.num_haplotypes} haplotypes x {hm.num_variants:,} variants "
-          f"({hm.n_total_sites:,} accessible bases, {t_load:.0f}s)",
-          flush=True)
+    n_pop = len(hm.sample_sets[POPULATION])
+    print(f"  {hm.num_haplotypes} haplotypes total, {n_pop} in {POPULATION}, "
+          f"{hm.num_variants:,} variants ({hm.n_total_sites:,} accessible "
+          f"bases, {t_load:.0f}s)", flush=True)
     return hm
 
 
@@ -129,6 +142,7 @@ def main():
     t0 = time.time()
     cp.cuda.Stream.null.synchronize()
     res = lostruct(hm,
+                   population=POPULATION,
                    window_size=WINDOW_SIZE,
                    step_size=STEP_SIZE,
                    window_type=WINDOW_TYPE,
@@ -165,7 +179,8 @@ def main():
     t0 = time.time()
     df_h12 = windowed_analysis(
         hm, window_size=GARUD_BP_WINDOW, step_size=GARUD_BP_STEP,
-        statistics=['garud_h12'], window_type='bp')
+        statistics=['garud_h12'], window_type='bp',
+        populations=[POPULATION])
     cp.cuda.Stream.null.synchronize()
     print(f"  {time.time() - t0:.1f}s, n_windows={len(df_h12)}", flush=True)
 
@@ -220,8 +235,9 @@ def main():
                         linewidths=1.2, label=f'corner {ci + 1}')
     ax_mds.set_xlabel('MDS 1')
     ax_mds.set_ylabel('MDS 2')
+    n_pop_hap = len(hm.sample_sets[POPULATION])
     ax_mds.set_title(f"Local-PCA MDS along {CHROM}\n"
-                      f"(n_haplotypes={hm.num_haplotypes}, "
+                      f"({POPULATION}: n_haplotypes={n_pop_hap}, "
                       f"n_windows={res.n_windows})", fontsize=10)
     ax_mds.legend(loc='best', fontsize=8)
 
@@ -253,7 +269,7 @@ def main():
     ax_h12.set_xlim(pos_mb.min(), pos_mb.max())
     ax_h12.legend(loc='best', fontsize=8)
 
-    fig.suptitle('pg_gpu lostruct on Ag1000G 3R',
+    fig.suptitle(f'pg_gpu lostruct on Ag1000G 3R ({POPULATION})',
                   fontsize=12, fontweight='bold', y=0.995)
     fig.savefig(f"{OUT_DIR_FIG}/ag1000g_lostruct.pdf", bbox_inches='tight')
     fig.savefig(f"{OUT_DIR_FIG}/ag1000g_lostruct.png",
