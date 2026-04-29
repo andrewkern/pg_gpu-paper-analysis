@@ -38,13 +38,22 @@ OUT_DIR_TBL = "05_application/tables"
 ZARR_PATH = "/sietch_colab/data_share/Ag1000G/Ag3.0/vcf/AgamP3.phased.zarr"
 MASK_NPZ = "/sietch_colab/data_share/Ag1000G/Ag3.0/args_trees/singer/agp3.is_accessible.txt.npz"
 CHROM = "3R"
-# With the streaming engine (engine='streaming-dense' below) GPU peak
-# memory is bounded by tile_size * n_hap^2 rather than n_windows *
-# n_hap^2, so 100 kb / 50 kb windows on the full 53 Mb arm at 2940
-# haplotypes (~1060 windows) fit comfortably alongside the 32 GB
+# Canonical Li and Ralph (2019) lostruct uses fixed-SNP-count windows
+# so each window has constant statistical power for the local PCA. The
+# streaming engine added in pg_gpu (engine='streaming-dense' below)
+# bounds peak GPU memory at the per-window working set, so 1000-SNP
+# non-overlapping windows over 10.9M phased Ag1000G 3R variants
+# (about 11k windows total) fit comfortably alongside the 32 GB
 # haplotype buffer on a single 80 GB A100.
-WINDOW_SIZE = 100_000   # bp window length
-STEP_SIZE = 50_000      # bp step (50% overlap)
+WINDOW_SIZE = 1_000     # SNPs per window
+STEP_SIZE = 1_000       # SNPs per step (non-overlapping)
+WINDOW_TYPE = 'snp'
+
+# Companion Garud H12 track stays on bp windows so the figure has a
+# stable Mb x-axis; lostruct windows of fixed SNP count have variable
+# physical width, but their per-window center is reported in bp.
+GARUD_BP_WINDOW = 100_000
+GARUD_BP_STEP = 50_000
 K_PCS = 2
 N_CORNERS = 3
 CORNER_PROP = 0.05
@@ -114,15 +123,15 @@ def main():
     cp.cuda.Stream.null.synchronize()
     print(f"  {time.time() - t0:.1f}s", flush=True)
 
-    print(f"\nRunning lostruct (window={WINDOW_SIZE//1000}kb, "
-          f"step={STEP_SIZE//1000}kb, k={K_PCS}, n_corners={N_CORNERS})...",
+    print(f"\nRunning lostruct (window={WINDOW_SIZE} {WINDOW_TYPE}, "
+          f"step={STEP_SIZE}, k={K_PCS}, n_corners={N_CORNERS})...",
           flush=True)
     t0 = time.time()
     cp.cuda.Stream.null.synchronize()
     res = lostruct(hm,
                    window_size=WINDOW_SIZE,
                    step_size=STEP_SIZE,
-                   window_type='bp',
+                   window_type=WINDOW_TYPE,
                    k=K_PCS,
                    corner_prop=CORNER_PROP,
                    n_corners=N_CORNERS,
@@ -148,12 +157,14 @@ def main():
         print(f"  {name:13s}  MDS1 centroid={c:+.3f}  "
               f"n_windows={(regime == name).sum()}", flush=True)
 
-    # Companion: windowed Garud's H12 along the same axis to anchor outlier
-    # windows in a familiar haplotype-frequency signal.
-    print(f"\nCompanion Garud H12 scan (same window/step)...", flush=True)
+    # Companion: windowed Garud's H12 in physical (bp) windows so the
+    # x-axis stays uniform in Mb across the figure even though the
+    # lostruct windows are SNP-defined and therefore variable in width.
+    print(f"\nCompanion Garud H12 scan ({GARUD_BP_WINDOW//1000}kb / "
+          f"{GARUD_BP_STEP//1000}kb bp windows)...", flush=True)
     t0 = time.time()
     df_h12 = windowed_analysis(
-        hm, window_size=WINDOW_SIZE, step_size=STEP_SIZE,
+        hm, window_size=GARUD_BP_WINDOW, step_size=GARUD_BP_STEP,
         statistics=['garud_h12'], window_type='bp')
     cp.cuda.Stream.null.synchronize()
     print(f"  {time.time() - t0:.1f}s, n_windows={len(df_h12)}", flush=True)
@@ -228,8 +239,9 @@ def main():
                          edgecolors=[corner_edges[ci]], s=70,
                          linewidths=1.0)
     ax_mds1.set_ylabel('MDS 1')
-    ax_mds1.set_title(f"{CHROM} ({WINDOW_SIZE // 1000}-kb windows, "
-                       f"{STEP_SIZE // 1000}-kb step)", fontsize=10)
+    ax_mds1.set_title(f"{CHROM} (lostruct {WINDOW_SIZE} SNPs / "
+                       f"{STEP_SIZE} step; H12 {GARUD_BP_WINDOW//1000}kb / "
+                       f"{GARUD_BP_STEP//1000}kb bp)", fontsize=10)
     plt.setp(ax_mds1.get_xticklabels(), visible=False)
 
     # bottom right: Garud H12 in matched windows
