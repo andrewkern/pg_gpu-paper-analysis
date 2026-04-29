@@ -11,9 +11,11 @@ Produces:
   - figures/benchmark_walltimes.pdf
 """
 
+import os
 import subprocess
 import sys
 import re
+import time
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -23,8 +25,88 @@ import seaborn as sns
 
 OUT_DIR_FIG = "02_performance/figures"
 OUT_DIR_TBL = "02_performance/tables"
+OUT_DIR_CACHE = "02_performance/cache"
 
 STRESS_TEST = "/home/adkern/pg_gpu/debug/stress_test_ag1000g.py"
+
+# LD subset benchmark configuration
+ZARR_PATH = "/sietch_colab/data_share/Ag1000G/Ag3.0/vcf/AgamP3.phased.zarr"
+CHROM = "3R"
+N_LD_SNPS = 10_000
+N_DIP_PER_POP = 100  # mirrors stress_test_ag1000g.py
+LD_CACHE = f"{OUT_DIR_CACHE}/ld_bench_3R.csv"
+
+
+def bench_pairwise_ld():
+    """Benchmark pg_gpu vs scikit-allel all-pairwise rogers_huff_r on
+    the first N_LD_SNPS contiguous SNPs of CHROM, restricted to the
+    first N_DIP_PER_POP diploids (mirrors the stress test's per-pop
+    sizing). The full 3R x 2940-hap pairwise r matrix is intractable
+    for scikit-allel, so this restricted setup gives a meaningful
+    apples-to-apples timing point.
+
+    Returns a row dict matching the parse_results schema.
+    """
+    import zarr
+    import allel
+    import cupy as cp
+    from pg_gpu import HaplotypeMatrix
+    from pg_gpu.ld_statistics import rogers_huff_r
+
+    print(f"Loading first {N_LD_SNPS:,} SNPs of {CHROM} for LD bench...",
+          flush=True)
+    t0 = time.time()
+    store = zarr.open(ZARR_PATH, mode='r')
+    chrom_grp = store[CHROM]
+    positions = np.array(chrom_grp['variants/POS'][:N_LD_SNPS])
+    gt = np.array(chrom_grp['calldata/GT'][:N_LD_SNPS, :N_DIP_PER_POP, :])
+    n_var, n_dip, ploidy = gt.shape
+    assert ploidy == 2
+
+    haplotypes = np.empty((n_var, 2 * n_dip), dtype=gt.dtype)
+    haplotypes[:, :n_dip] = gt[:, :, 0]
+    haplotypes[:, n_dip:] = gt[:, :, 1]
+    haplotypes = haplotypes.T  # (n_hap, n_var)
+    print(f"  {haplotypes.shape[0]} haplotypes x {haplotypes.shape[1]:,} "
+          f"variants ({time.time()-t0:.0f}s)", flush=True)
+
+    hm = HaplotypeMatrix(haplotypes, positions,
+                          int(positions[0]), int(positions[-1]))
+    hm.transfer_to_gpu()
+
+    # scikit-allel format: (n_var, n_dip) int8 dosages in {0,1,2}
+    gn = (haplotypes[0::2] + haplotypes[1::2]).T.astype(np.int8)
+
+    print("Timing pg_gpu rogers_huff_r (1 warmup + 3 timed)...", flush=True)
+    rogers_huff_r(hm); cp.cuda.Stream.null.synchronize()
+    t_pg = []
+    for _ in range(3):
+        cp.cuda.Stream.null.synchronize()
+        t = time.perf_counter()
+        rogers_huff_r(hm)
+        cp.cuda.Stream.null.synchronize()
+        t_pg.append(time.perf_counter() - t)
+    t_pg_med = float(np.median(t_pg))
+
+    print("Timing scikit-allel rogers_huff_r (1 warmup + 3 timed)...",
+          flush=True)
+    allel.rogers_huff_r(gn)
+    t_al = []
+    for _ in range(3):
+        t = time.perf_counter()
+        allel.rogers_huff_r(gn)
+        t_al.append(time.perf_counter() - t)
+    t_al_med = float(np.median(t_al))
+
+    speedup = t_al_med / t_pg_med if t_pg_med > 0 else float('nan')
+    print(f"  pg_gpu={t_pg_med:.4f}s  allel={t_al_med:.4f}s  "
+          f"speedup={speedup:.1f}x", flush=True)
+    return {
+        "statistic": f"ld.rogers_huff_r ({N_LD_SNPS//1000}k SNPs)",
+        "pg_gpu_s": t_pg_med,
+        "allel_s": t_al_med,
+        "speedup": speedup,
+    }
 
 
 def parse_results(text):
@@ -107,7 +189,7 @@ def main():
             text = f.read()
         print(f"Using cached results from {cached}")
     except FileNotFoundError:
-        print("Running stress test (this takes ~30 minutes)...")
+        print("Running stress test (this takes a few hours on full Ag1000G 3R)...")
         result = subprocess.run(
             ["pixi", "run", "python", STRESS_TEST],
             capture_output=True, text=True, cwd="/home/adkern/pg_gpu")
@@ -115,8 +197,28 @@ def main():
         if result.returncode != 0:
             print(f"Warning: stress test exited with code {result.returncode}")
             print(result.stderr[-500:] if result.stderr else "")
+        else:
+            with open(cached, 'w') as f:
+                f.write(text)
+            print(f"Stress test output cached at {cached}")
 
     df = parse_results(text)
+
+    # LD subset benchmark (cached separately; pre-existing stress test
+    # doesn't include all-pairwise LD because the full 3R x 2940-hap
+    # matrix is intractable for scikit-allel).
+    os.makedirs(OUT_DIR_CACHE, exist_ok=True)
+    if os.path.exists(LD_CACHE):
+        ld_df = pd.read_csv(LD_CACHE)
+        print(f"\nUsing cached LD bench from {LD_CACHE}")
+    else:
+        print("\nRunning LD subset bench (not in stress test cache)...")
+        ld_row = bench_pairwise_ld()
+        ld_df = pd.DataFrame([ld_row])
+        ld_df.to_csv(LD_CACHE, index=False)
+        print(f"LD bench cached at {LD_CACHE}")
+    df = pd.concat([df, ld_df], ignore_index=True)
+
     df.to_csv(f"{OUT_DIR_TBL}/benchmark_3R.csv", index=False)
     print(f"\n{len(df)} statistics benchmarked")
     print(df.to_string(index=False))
