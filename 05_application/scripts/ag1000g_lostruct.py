@@ -6,12 +6,11 @@ Runs the four-step Li & Ralph (2019) pipeline on the same West African
 subset (200 phased haplotypes, 100 diploid individuals) used by the
 companion genome-scan workflow in ag1000g_workflow.py: per-window local
 PCA, Frobenius distance between window covariance representations,
-classical MDS, and corner detection in MDS space. A 1D k-means
-partitions windows into baseline / intermediate / outlier regimes by
-MDS1 distance from the chromosome-wide median, identifying genomic
-intervals whose local sample structure deviates most from the
-genome-wide pattern (e.g. inversions, large segregating SVs, or recent
-sweeps).
+classical MDS, and corner detection in MDS space. The MDS scatter is
+plotted with a single neutral fill, with the windows that fall in
+each detected corner circled per Li & Ralph (2019) Figure 2; a
+companion windowed Garud's H12 track in physical (bp) windows
+provides a familiar haplotype-frequency anchor.
 
 Produces:
   - tables/ag1000g_lostruct_windows.csv
@@ -29,9 +28,8 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 import seaborn as sns
-from scipy.cluster.vq import kmeans2
 
-from pg_gpu import HaplotypeMatrix, lostruct, windowed_analysis
+from pg_gpu import HaplotypeMatrix, lostruct, windowed_analysis, selection
 from pg_gpu.accessible import AccessibleMask
 
 OUT_DIR_FIG = "05_application/figures"
@@ -53,20 +51,16 @@ WINDOW_SIZE = 1_000     # SNPs per window
 STEP_SIZE = 1_000       # SNPs per step (non-overlapping)
 WINDOW_TYPE = 'snp'
 
-# Companion Garud H12 track stays on bp windows so the figure has a
-# stable Mb x-axis; lostruct windows of fixed SNP count have variable
-# physical width, but their per-window center is reported in bp.
-GARUD_BP_WINDOW = 100_000
-GARUD_BP_STEP = 50_000
+# Companion Garud H12 track uses the *same* SNP-defined windows as
+# the lostruct pass so the two panels share identical x-coordinates.
+# Computing H12 in bp windows on a sweep region that's only ~0.3 Mb
+# wide smears the signal across the wider 100 kb window and produces
+# spurious offset between the lostruct corners and H12 peaks.
 K_PCS = 2
 N_CORNERS = 3
-CORNER_PROP = 0.05
+# Smaller corner_prop -> tighter / more visually distinct corner clusters.
+CORNER_PROP = 0.01
 RANDOM_STATE = 42
-
-REGIME_NAMES = ("baseline", "intermediate", "outlier")
-REGIME_COLORS = {"baseline": "#4C9AFF",
-                  "intermediate": "#F2B84B",
-                  "outlier":     "#D94E4E"}
 
 
 def load_data():
@@ -109,24 +103,6 @@ def load_data():
     return hm
 
 
-def cluster_mds1(mds1, seed=RANDOM_STATE):
-    """1D k-means (k=3) on MDS1, relabeled by distance from the median.
-
-    Closest cluster -> 'baseline' (genome-wide PCA pattern), middle
-    -> 'intermediate', farthest -> 'outlier' (windows where local
-    structure deviates most strongly).
-    """
-    centroids, labels = kmeans2(mds1.astype(np.float64), k=3,
-                                 minit='++', seed=seed)
-    dist = np.abs(centroids - np.median(mds1))
-    rank = np.argsort(dist)
-    remap = np.empty(3, dtype=np.int64)
-    for rank_idx, cluster_idx in enumerate(rank):
-        remap[cluster_idx] = rank_idx
-    regime = np.array([REGIME_NAMES[remap[l]] for l in labels])
-    return regime, centroids[rank]
-
-
 def main():
     hm = load_data()
 
@@ -164,25 +140,35 @@ def main():
     ends = res.windows['end'].to_numpy()
     corner_idx = res.corner_indices
 
-    print("\nClustering MDS1 -> baseline / intermediate / outlier (k=3)...",
-          flush=True)
-    regime, regime_centroids = cluster_mds1(mds[:, 0])
-    for name, c in zip(REGIME_NAMES, regime_centroids):
-        print(f"  {name:13s}  MDS1 centroid={c:+.3f}  "
-              f"n_windows={(regime == name).sum()}", flush=True)
-
-    # Companion: windowed Garud's H12 in physical (bp) windows so the
-    # x-axis stays uniform in Mb across the figure even though the
-    # lostruct windows are SNP-defined and therefore variable in width.
-    print(f"\nCompanion Garud H12 scan ({GARUD_BP_WINDOW//1000}kb / "
-          f"{GARUD_BP_STEP//1000}kb bp windows)...", flush=True)
+    # Companion: Garud's H12 in the SAME 1000-SNP non-overlapping
+    # windows as lostruct. selection.moving_garud_h precomputes a
+    # global prefix-sum hash that needs three full float64 copies of
+    # the haplotype matrix (~52 GB at 200 hap x 10.9M var) -- OOMs
+    # on a single A100. Loop in Python instead and call the scalar
+    # selection.garud_h per window: each window is just 200 x 1000
+    # int8 (200 KB), so the total cost is dominated by Python overhead
+    # not GPU work.
+    print(f"\nCompanion Garud H12 scan ({WINDOW_SIZE} SNPs / step "
+          f"{STEP_SIZE}, matching lostruct)...", flush=True)
     t0 = time.time()
-    df_h12 = windowed_analysis(
-        hm, window_size=GARUD_BP_WINDOW, step_size=GARUD_BP_STEP,
-        statistics=['garud_h12'], window_type='bp',
-        populations=[POPULATION])
-    cp.cuda.Stream.null.synchronize()
+    pos_cpu = hm.positions
+    if hasattr(pos_cpu, 'get'):
+        pos_cpu = pos_cpu.get()
+    n_var_total = len(pos_cpu)
+    h12_vals = []
+    h12_centers = []
+    for w_start in range(0, n_var_total - WINDOW_SIZE + 1, STEP_SIZE):
+        w_end = w_start + WINDOW_SIZE
+        hm_w = hm.get_subset(np.arange(w_start, w_end))
+        _, h12, _, _ = selection.garud_h(hm_w, population=POPULATION)
+        h12_vals.append(float(h12))
+        h12_centers.append((pos_cpu[w_start] + pos_cpu[w_end - 1]) / 2)
+    df_h12 = pd.DataFrame({
+        'center': np.array(h12_centers),
+        'garud_h12': np.array(h12_vals),
+    })
     print(f"  {time.time() - t0:.1f}s, n_windows={len(df_h12)}", flush=True)
+    df_h12.to_csv(f"{OUT_DIR_TBL}/ag1000g_lostruct_h12.csv", index=False)
 
     # ---------------- save tables ----------------
     win_df = pd.DataFrame({
@@ -191,7 +177,6 @@ def main():
         'center': centers,
         'mds1': mds[:, 0],
         'mds2': mds[:, 1],
-        'regime': regime,
     })
     win_df.to_csv(f"{OUT_DIR_TBL}/ag1000g_lostruct_windows.csv", index=False)
 
@@ -219,20 +204,21 @@ def main():
     ax_mds1 = fig.add_subplot(gs[0, 1])
     ax_h12 = fig.add_subplot(gs[1, 1], sharex=ax_mds1)
 
-    # left: MDS scatter, coloured by regime
-    for name in REGIME_NAMES:
-        m = regime == name
-        ax_mds.scatter(mds[m, 0], mds[m, 1],
-                        c=REGIME_COLORS[name], s=18,
-                        edgecolors='white', linewidths=0.2,
-                        label=f"{name} (n={m.sum()})")
+    # left: MDS scatter, no regime colouring -- neutral grey fill for
+    # all windows, with the corner windows circled per Li and Ralph
+    # (2019) Figure 2. Base colour is a desaturated grey so the three
+    # tab10 corner colours all read clearly against it.
+    POINT_COLOR = '#9aa6b1'
+    ax_mds.scatter(mds[:, 0], mds[:, 1],
+                    c=POINT_COLOR, s=8,
+                    edgecolors='white', linewidths=0.1, alpha=0.7)
     corner_edges = plt.get_cmap('tab10')(range(N_CORNERS))
     for ci in range(N_CORNERS):
         ax_mds.scatter(mds[corner_idx[:, ci], 0],
                         mds[corner_idx[:, ci], 1],
                         facecolors='none',
                         edgecolors=[corner_edges[ci]], s=120,
-                        linewidths=1.2, label=f'corner {ci + 1}')
+                        linewidths=1.4, label=f'corner {ci + 1}')
     ax_mds.set_xlabel('MDS 1')
     ax_mds.set_ylabel('MDS 2')
     n_pop_hap = len(hm.sample_sets[POPULATION])
@@ -241,33 +227,36 @@ def main():
                       f"n_windows={res.n_windows})", fontsize=10)
     ax_mds.legend(loc='best', fontsize=8)
 
-    # top right: MDS1 along chromosome
+    # top right: MDS1 along chromosome -- single neutral colour, with
+    # the corner windows circled.
     pos_mb = centers / 1e6
-    for name in REGIME_NAMES:
-        m = regime == name
-        ax_mds1.scatter(pos_mb[m], mds[m, 0],
-                         c=REGIME_COLORS[name], s=12,
-                         edgecolors='white', linewidths=0.15)
+    ax_mds1.scatter(pos_mb, mds[:, 0],
+                     c=POINT_COLOR, s=8,
+                     edgecolors='white', linewidths=0.1, alpha=0.7)
     for ci in range(N_CORNERS):
         ax_mds1.scatter(pos_mb[corner_idx[:, ci]],
                          mds[corner_idx[:, ci], 0],
                          facecolors='none',
                          edgecolors=[corner_edges[ci]], s=70,
-                         linewidths=1.0)
+                         linewidths=1.2)
     ax_mds1.set_ylabel('MDS 1')
-    ax_mds1.set_title(f"{CHROM} (lostruct {WINDOW_SIZE} SNPs / "
-                       f"{STEP_SIZE} step; H12 {GARUD_BP_WINDOW//1000}kb / "
-                       f"{GARUD_BP_STEP//1000}kb bp)", fontsize=10)
+    ax_mds1.set_title(f"{CHROM} ({WINDOW_SIZE}-SNP non-overlapping "
+                       f"windows; lostruct + Garud $H_{{12}}$)", fontsize=10)
     plt.setp(ax_mds1.get_xticklabels(), visible=False)
 
-    # bottom right: Garud H12 in matched windows
+    # bottom right: Garud H12 along the chromosome as a filled
+    # area chart -- much cleaner than a 1064-segment line at this
+    # zoom level on a single-population subset.
     h12_centers_mb = df_h12['center'].to_numpy() / 1e6
-    ax_h12.plot(h12_centers_mb, df_h12['garud_h12'].to_numpy(),
-                color='steelblue', lw=0.7, alpha=0.9, label='Garud $H_{12}$')
+    h12_vals = df_h12['garud_h12'].to_numpy()
+    ax_h12.fill_between(h12_centers_mb, 0, h12_vals,
+                         color='steelblue', alpha=0.5, linewidth=0)
+    ax_h12.plot(h12_centers_mb, h12_vals,
+                 color='steelblue', lw=0.4, alpha=0.9)
     ax_h12.set_xlabel(f'{CHROM} position (Mb)')
-    ax_h12.set_ylabel('Garud $H_{12}$')
-    ax_h12.set_xlim(pos_mb.min(), pos_mb.max())
-    ax_h12.legend(loc='best', fontsize=8)
+    ax_h12.set_ylabel(r'Garud $H_{12}$')
+    ax_h12.set_xlim(h12_centers_mb.min(), h12_centers_mb.max())
+    ax_h12.set_ylim(0, max(h12_vals.max() * 1.05, 0.05))
 
     fig.suptitle(f'pg_gpu lostruct on Ag1000G 3R ({POPULATION})',
                   fontsize=12, fontweight='bold', y=0.995)
