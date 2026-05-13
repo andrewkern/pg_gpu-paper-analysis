@@ -1,0 +1,37 @@
+{
+  "model": "OutOfAfrica_2T12",
+  "genetic_map": "HapMapII_GRCh38",
+  "chromosome": "15",
+  "chromosome_length": 101991189,
+  "haplotypes_per_pop": 100000,
+  "n_sites": 11638651,
+  "garud_subsample": 1000,
+  "joint_sfs_subsample": 200,
+  "ld_subsample": 5000,
+  "ld_heatmap_min_maf": 0.05,
+  "ld_heatmap_region": [
+    60400453,
+    61400453
+  ],
+  "ld_heatmap_n_snps": 2000,
+  "windows": {
+    "10kb": 8220,
+    "100kb": 822,
+    "1mb": 83
+  },
+  "genomewide_100kb": {
+    "mean_pi_AFR": 0.0007464001765162731,
+    "mean_pi_EUR": 0.0005445222377749767,
+    "mean_theta_w_AFR": 0.00586784467966232,
+    "mean_theta_w_EUR": 0.005856460981261652,
+    "mean_tajimas_d_AFR": -2.2576910808545434,
+    "mean_tajimas_d_EUR": -2.346162833531513,
+    "mean_normalized_fay_wu_h_AFR": 0.02777598040101844,
+    "mean_normalized_fay_wu_h_EUR": -0.08248739748880374,
+    "mean_fst": 0.16183473043670515,
+    "mean_dxy": 0.0007749879788831171,
+    "mean_da": 0.00012952677173749239,
+    "total_segregating_sites_AFR": 5830887.0,
+    "total_segregating_sites_EUR": 5819575.0
+  }
+}

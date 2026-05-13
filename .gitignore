@@ -1,3 +1,5 @@
 paper/
 __pycache__/
 *.pyc
+.venv/
+06_simulated_genome_scan/data/
