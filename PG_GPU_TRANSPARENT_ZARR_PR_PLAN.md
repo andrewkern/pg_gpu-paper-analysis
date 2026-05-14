@@ -189,10 +189,14 @@ in 80 lines instead of 1000.
     `BiobankScaleWarning`, `BadlyChunkedWarning`.
 
 `pyproject.toml` / `pixi.toml`
-  - Add `kvikio` and `nvidia-nvcomp` as **optional** dependencies in
-    a `[project.optional-dependencies] kvikio` extra (pip) and a
-    `[feature.kvikio]` table (pixi). The library imports them
-    conditionally; absence falls back to host path silently.
+  - Add `kvikio` and `nvidia-nvcomp` as **required** dependencies on
+    a par with `cupy`, `zarr`, and `bio2zarr`. The library imports
+    them unconditionally; there is no host-only install path. This
+    matches `pg_gpu`'s GPU-first stance (per `pg_gpu/CLAUDE.md`:
+    "do not write CPU fallbacks") and removes a whole class of
+    optional-import branches from the streaming code. Users without
+    a CUDA-capable GPU are already unable to use the library;
+    requiring kvikio adds no new floor on that audience.
 
 ## Detection logic
 
@@ -223,17 +227,16 @@ def decide_layout(source, streaming="auto", backend="auto"):
     if mode == "eager":
         return ("eager", None)
 
-    # 2. Which backend?
+    # 2. Which backend? kvikio is a hard dependency, so there is no
+    # "is kvikio importable" branch -- we know it is. The only
+    # questions are codec support and chunk shape.
     if backend == "host":
         return ("streaming", "host")
     if backend in ("kvikio", "kvikio-gds"):
-        _require_kvikio_or_raise()
         _require_supported_codec_or_raise(source)
         return ("streaming", backend)
 
     # backend == "auto"
-    if not _have_kvikio():
-        return ("streaming", "host")
     if not _codec_is_gpu_decodable(source):
         return ("streaming", "host")
     if not _chunking_is_subset_friendly(source):
@@ -255,8 +258,6 @@ def decide_layout(source, streaming="auto", backend="auto"):
 
 Helpers:
 
-* `_have_kvikio()`: `try: import kvikio, kvikio.zarr, nvidia.nvcomp;
-  return True except ImportError: return False`. Cached.
 * `_codec_is_gpu_decodable(source)`: read the
   `call_genotype/zarr.json` codec spec and check it's in
   `{"zstd", "blosc", "lz4", "deflate"}`.
@@ -404,15 +405,29 @@ prototype within 10%.
 
 ### PR 6 -- `KvikioChunkFetcher` + backend auto-detection
 
-Adds `KvikioChunkFetcher`. Guarded imports of `kvikio`,
-`kvikio.zarr`, `nvidia.nvcomp`; absence falls back to host silently.
-Forces `kvikio.defaults.set({"compat_mode": kvikio.CompatMode.ON,
-"num_threads": 8})` unless the user explicitly opts into `kvikio-gds`.
-Probes store codec and chunk shape, emits `BadlyChunkedWarning` when
-the chunks would defeat kvikio's win.
+Adds `KvikioChunkFetcher` using `kvikio.zarr.GDSStore` +
+`zarr.config.enable_gpu()`. kvikio and nvidia-nvcomp are hard
+dependencies (added in `pyproject.toml` / `pixi.toml` in this PR),
+so the imports at the top of `streaming_matrix.py` are
+unconditional -- no `try/except ImportError`, no `_have_kvikio()`
+helper. If kvikio fails to import at module load, that's a real
+install problem and the user should see it immediately, not at
+first use.
 
-Tests:
-- `test_kvikio_backend.py`: skipped if `kvikio` not importable.
+`KvikioChunkFetcher.__init__` forces
+`kvikio.defaults.set({"compat_mode": kvikio.CompatMode.ON,
+"num_threads": 8})` unless the user explicitly opts into
+`kvikio-gds`. Probes the store's `call_genotype` codec and chunk
+shape; emits `BadlyChunkedWarning` when the chunks would defeat
+kvikio's win (whole-sample-axis chunking, measured 26.8 s vs 26.9 s
+host on `chr15.vcz.oldchunk` -- no speedup) and falls back to
+`HostChunkFetcher` for that store.
+
+Resets the zarr buffer prototype on `close()` / `__del__` /
+context-manager exit so subsequent eager calls in the same process
+get the CPU buffer back.
+
+Tests (`test_kvikio_backend.py`, always runs in CI, no skip):
 - Build two synthetic stores: one with `(10000, 1000, 2)` chunks, one
   with `(10000, n_dip, 2)`. `backend="auto"` picks `kvikio` on the
   first and `host` (with `BadlyChunkedWarning`) on the second.
@@ -421,6 +436,8 @@ Tests:
 - Byte-equality check: `KvikioChunkFetcher` chunks match
   `HostChunkFetcher` chunks for the same region on the same store.
 - Sample-subset oindex returns byte-equal output to host path.
+- After `KvikioChunkFetcher.close()`, a subsequent eager
+  `from_zarr` call returns numpy buffers (zarr config restored).
 
 Acceptance: on the chr15 paper-analysis VCZ, end-to-end scan with
 `backend="auto"` finishes in ~2 h 30 min wall (vs ~3 h 28 min on the
@@ -496,9 +513,10 @@ A new `tests/perf/test_streaming_perf.py` (manual / nightly) checks:
 * Eager `from_zarr` on a 1 Mb region: peak host RSS < 2 GB.
 * Streaming + host: per-chunk wall < 100 s on a 1 Mb / 200k-hap
   chunk; `cpu/wall > 3x` on the producer.
-* Streaming + kvikio (when kvikio importable, store zstd-coded,
-  bio2zarr-chunked): per-chunk read wall < 5 s, sample-subset oindex
-  wall < 1 s. `cpu/wall > 5x`.
+* Streaming + kvikio (store zstd-coded, bio2zarr-chunked):
+  per-chunk read wall < 5 s, sample-subset oindex wall < 1 s.
+  `cpu/wall > 5x`. (kvikio is a hard dependency; no "if importable"
+  qualifier.)
 * End-to-end chr15 windowed scan completes within 110 min wall on
   the host backend, within 90 min wall on the kvikio backend, on
   an A100 80 GB / 64-core / NVMe host. (Numbers calibrated to the
@@ -529,10 +547,10 @@ A new `tests/perf/test_streaming_perf.py` (manual / nightly) checks:
 
 * **`zarr` 2 vs zarr 3.** `pg_gpu`'s `pixi.toml` allows `zarr >=
   2.16`. The kvikio path requires zarr 3.x (`zarr.config.enable_gpu()`
-  is a zarr-3 API). PR 6 should either bump the lower bound to
-  zarr 3 unconditionally, or guard the kvikio path on a zarr-3
-  detection. Recommend the former: zarr 3 has been out long enough
-  and our `zarr_io.py` is already written for the modern API.
+  is a zarr-3 API). Since kvikio is now a hard dependency, the
+  lower bound on zarr should be bumped to `>= 3.0` in PR 6 -- there
+  is no longer a "guard on zarr 3 detection" path because there is
+  no host-only build configuration.
 
 * **`scikit-allel` zarr layouts and streaming.** The existing
   `read_genotypes_allel*` functions support the legacy scikit-allel
@@ -548,12 +566,22 @@ A new `tests/perf/test_streaming_perf.py` (manual / nightly) checks:
   `ChunkedHaplotypeMatrix` is technically what it is. Decide during
   PR 3 review.
 
-* **The `pop_file` resolution.** Auto-loading `<store>.pops.tsv` is
-  convenient but slightly magical. Consider whether to require it
-  to be explicit on the streaming path (where pop assignments are
-  fixed at construction) while keeping the auto-load on eager.
-  Recommend: auto-load on both, single-line `print` to stderr
-  showing what was loaded so it's not invisible.
+* **The `pop_file` resolution.** Reuse the existing
+  `HaplotypeMatrix.load_pop_file()` schema
+  (`pg_gpu/haplotype_matrix.py:475`) -- a tab-delimited file with
+  columns `sample`, `pop` and an optional header line starting
+  with `sample`. Both the eager and streaming paths should call
+  `load_pop_file` internally rather than re-implementing the parse,
+  so the file format is documented in exactly one place and any
+  future changes (e.g. multiple-pop labels per sample) flow to
+  both paths.
+
+  Auto-loading `<store>.pops.tsv` is convenient but slightly
+  magical. Recommend: when `pop_file=None`, look for
+  `<store>.pops.tsv` next to the store; if present, call
+  `load_pop_file` on it and emit a single-line `print` to stderr
+  showing what was loaded (so the choice isn't invisible). If the
+  user passes `pop_file=...` explicitly, no print.
 
 ## What's not in this plan
 
