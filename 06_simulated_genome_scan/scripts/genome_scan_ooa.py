@@ -471,11 +471,9 @@ def windowed_scan(source, chunk_bp, prefetch=1):
                 hm, window_size=bp, step_size=bp,
                 statistics=DIVERSITY_STATS, populations=[p])
                 for p in POPS}
-            t = _stage(f"diversity-{label}", t)
             df_div = windowed_analysis(
                 hm, window_size=bp, step_size=bp,
                 statistics=DIVERGENCE_STATS, populations=list(POPS))
-            t = _stage(f"divergence-{label}", t)
             m = per_pop[POPS[0]][["start", "end", "center"]].copy()
             m.insert(0, "chrom", str(source.chrom))
             for p in POPS:
@@ -495,7 +493,6 @@ def windowed_scan(source, chunk_bp, prefetch=1):
         gm_df.insert(0, "chrom", str(source.chrom))
         for s in GARUD_STATS:
             gm_df[f"{s}_{POPS[0]}"] = g_afr[s].values
-        t = _stage("garud-AFR", t)
         g_eur = windowed_analysis(hm, window_size=GARUD_SCALE_BP,
                                   step_size=GARUD_SCALE_BP,
                                   statistics=GARUD_STATS,
@@ -505,16 +502,13 @@ def windowed_scan(source, chunk_bp, prefetch=1):
         gm_df = gm_df[gm_df["n_variants"].values > 0]
         if not gm_df.empty:
             garud_parts.append(gm_df.reset_index(drop=True))
-        t = _stage("garud-EUR", t)
 
         for p in POPS:
             s = np.asarray(sfs.sfs(hm, population=p))
             sfs_by_pop[p] = s if sfs_by_pop[p] is None else sfs_by_pop[p] + s
-        t = _stage("marginal-sfs", t)
         j = np.asarray(sfs.joint_sfs(hm, pop1=list(sub_j[POPS[0]]),
                                      pop2=list(sub_j[POPS[1]])))
         joint = j if joint is None else joint + j
-        t = _stage("joint-sfs", t)
 
         del hm
         free_gpu()
