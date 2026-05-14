@@ -47,6 +47,10 @@ def parse_args():
                         "e.g. 'chr15.trees' -> '15')")
     p.add_argument("--variant-chunk", type=int, default=10_000,
                    help="variants per zarr chunk along the variant axis (default 10000)")
+    p.add_argument("--sample-chunk", type=int, default=1_000,
+                   help="diploids per zarr chunk along the sample axis "
+                        "(default 1000, matching bio2zarr's default for "
+                        "call_genotype)")
     p.add_argument("--progress-every", type=int, default=50,
                    help="print progress every N chunks (default 50)")
     p.add_argument("--pop-file", default=None,
@@ -87,7 +91,14 @@ def main():
     print(f"Writing VCZ store to {out_path}", flush=True)
 
     B = int(args.variant_chunk)
-    sample_chunk = min(n_dip, 100_000)
+    # bio2zarr's default sample-axis chunk size for call_genotype. Smaller
+    # chunks along the sample axis cost a bit more zarr / blosc coordination
+    # on full-population reads (~14x more chunks to fetch per variant chunk
+    # at this scale), but unlock a much cheaper sample-subset read: an
+    # oindex over a few thousand contiguous diploids only has to decompress
+    # the few sample chunks they live in, instead of every chunk's full
+    # sample axis. The LD probes use this path heavily.
+    sample_chunk = min(n_dip, args.sample_chunk)
 
     g = zarr.create_group(store=str(out_path), overwrite=True)
 

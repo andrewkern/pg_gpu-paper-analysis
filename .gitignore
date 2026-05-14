@@ -2,4 +2,6 @@ paper/
 __pycache__/
 *.pyc
 .venv/
+.venv-*/
+cufile.log
 06_simulated_genome_scan/data/
