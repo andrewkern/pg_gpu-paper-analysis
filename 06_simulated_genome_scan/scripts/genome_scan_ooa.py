@@ -241,27 +241,23 @@ class ZarrSource:
         return lo, hi
 
     def slice_region(self, left, right):
-        """All-haplotype slice. Returns
-        ``(gm (n_biallelic, num_haplotypes) int8, pos (n_biallelic,) float64)``.
-        Multiallelic / masked rows (gt = -1) are dropped."""
+        """All-haplotype slice. Returns the raw zarr genotype array
+        ``(gt (n_var, n_dip, 2) int8, pos (n_var,) float64)``.
+
+        Multiallelic / masked rows (gt = -1) are kept in place; downstream
+        ``build_hm`` filters them on the GPU. The biallelic filter and the
+        ploidy reshape used to be done here on the host, but each was a
+        ~28 GB allocate + page-fault + copy that dominated the per-chunk
+        wall time. Doing them on the GPU as part of the same kernel that
+        builds the (n_hap, n_var) view is ~10x cheaper."""
         lo, hi = self._site_index_range(left, right)
         if hi <= lo:
-            return np.empty((0, self.num_haplotypes), np.int8), np.empty(0)
+            return np.empty((0, self.n_dip, 2), np.int8), np.empty(0)
         zlo = int(self._zarr_var_indices[lo])
         zhi = int(self._zarr_var_indices[hi - 1]) + 1
         gt = np.asarray(self.store["call_genotype"][zlo:zhi])   # (n, n_dip, 2) int8
         pos = self.site_pos[lo:hi].copy()
-        biallelic = gt[:, 0, 0] >= 0
-        gt = gt[biallelic]
-        pos = pos[biallelic]
-        n_var = gt.shape[0]
-        if n_var == 0:
-            return np.empty((0, self.num_haplotypes), np.int8), np.empty(0)
-        # Lay out as (n_var, 2 * n_dip) -- ploidy 0 then ploidy 1.
-        gm = np.empty((n_var, self.num_haplotypes), dtype=np.int8)
-        gm[:, : self.n_dip] = gt[:, :, 0]
-        gm[:, self.n_dip:] = gt[:, :, 1]
-        return gm, pos
+        return gt, pos
 
     def slice_subsample(self, left, right, hap_cols):
         """Variants in ``[left, right)`` restricted to the given haplotype
@@ -310,17 +306,42 @@ def read_common_variants(source, left, right, hap_cols, min_maf):
     return np.ascontiguousarray(gm[keep]), pos[keep]
 
 
-def build_hm(gm, pos, left, right, sample_sets):
-    """Build a GPU HaplotypeMatrix from a chunk's ``(n_var, n_hap)`` array.
+def build_hm(gt, pos, left, right, sample_sets):
+    """Build a GPU HaplotypeMatrix from a chunk's raw zarr genotype array
+    ``gt`` of shape ``(n_var, n_dip, 2)`` int8.
 
-    The transpose to ``(n_hap, n_var)`` is done on the GPU rather than the
-    host: numpy's strided int8 transpose of a tall-skinny chunk is single-
-    threaded and cache-thrashes (measured ~80 MB/s here), whereas a PCIe
-    Gen4 upload of the row-major chunk (~25 GB/s) followed by cupy's tiled
-    transpose kernel is orders of magnitude faster."""
-    gm_gpu = cp.asarray(gm)                       # (n_var, n_hap), host -> device
-    haps = cp.ascontiguousarray(gm_gpu.T)         # (n_hap, n_var) on device
-    del gm_gpu                                    # free the row-major staging copy
+    Three things have to happen between the zarr layout and what pg_gpu
+    expects (``(n_hap, n_var)`` int8): drop multiallelic rows (where
+    ``gt == -1``), interleave the two ploidies into a single haplotype
+    axis, and transpose. Doing any of these on the host as a numpy copy is
+    a ~28 GB allocate + page-fault + memcpy that single-threads and
+    dominates the per-chunk wall (~30 s each). Doing all three on the
+    GPU after a single PCIe upload (~1 s at Gen4 x16) is bandwidth-bound
+    and well-tiled by cupy.
+
+    The reshape ``gt.transpose(2, 1, 0).reshape(2*n_dip, n_var)`` places
+    ploidy-0 samples first (haps ``0..n_dip-1``) and ploidy-1 samples
+    second (haps ``n_dip..2*n_dip-1``), matching the convention used by
+    the sample_sets dict (where ``hap_cols[i]`` indexes the same diploid
+    on the same ploidy as the input zarr)."""
+    n_dip = gt.shape[1]
+    gt_gpu = cp.asarray(gt)                                # (n_var, n_dip, 2) on GPU
+    if gt.size:
+        # Filter on a single column (ploidy 0 of the first diploid). -1 is the
+        # convention used by ts_to_vcz for multiallelic / recurrent-mutation
+        # rows, which propagate to every (dip, ploidy) cell of the row.
+        # cupy boolean indexing on the (n_var, n_dip, 2) shape blows the mask
+        # up to int64 (n_var, n_dip, 2) indices (~227 GB on a 1 Mb / 200k-hap
+        # chunk and OOMs), so use compress() which is a one-shot axis-0
+        # gather with a (n_var,) bool mask -- a single output allocation, no
+        # broadcasting.
+        biallelic = gt_gpu[:, 0, 0] >= 0
+        if not bool(biallelic.all()):
+            gt_gpu = gt_gpu.compress(biallelic, axis=0)
+            pos = pos[cp.asnumpy(biallelic)]
+    n_var = int(gt_gpu.shape[0])
+    haps = cp.ascontiguousarray(gt_gpu.transpose(2, 1, 0).reshape(2 * n_dip, n_var))
+    del gt_gpu
     positions = cp.asarray(pos)
     return HaplotypeMatrix(haps, positions,
                            chrom_start=int(left), chrom_end=int(right) - 1,
@@ -345,7 +366,7 @@ def free_gpu():
 
 
 def chunk_iterator(source, chunks, prefetch):
-    """Yield ``(ci, left, right, gm, pos, t_read_s)`` for each chunk.
+    """Yield ``(ci, left, right, gt, pos, t_read_s)`` for each chunk.
 
     ``prefetch=0`` reads chunks serially in the main thread (each iteration
     blocks until the read completes, then hands off to compute).
@@ -359,8 +380,8 @@ def chunk_iterator(source, chunks, prefetch):
     if prefetch <= 0:
         for ci, (left, right) in enumerate(chunks):
             t0 = time.perf_counter()
-            gm, pos = source.slice_region(left, right)
-            yield ci, left, right, gm, pos, time.perf_counter() - t0
+            gt, pos = source.slice_region(left, right)
+            yield ci, left, right, gt, pos, time.perf_counter() - t0
         return
 
     q = queue.Queue(maxsize=prefetch)
@@ -373,11 +394,11 @@ def chunk_iterator(source, chunks, prefetch):
                 if stop.is_set():
                     return
                 t0 = time.perf_counter()
-                gm, pos = source.slice_region(left, right)
+                gt, pos = source.slice_region(left, right)
                 t_read = time.perf_counter() - t0
                 if stop.is_set():
                     return
-                q.put((ci, left, right, gm, pos, t_read))
+                q.put((ci, left, right, gt, pos, t_read))
         except BaseException as e:                   # producer-side failures
             q.put(("ERR", e))
             return
@@ -439,32 +460,29 @@ def windowed_scan(source, chunk_bp, prefetch=1):
     joint = None
 
     t_scan = time.perf_counter()
-    sum_read, sum_compute, sum_wait = 0.0, 0.0, 0.0
-    for ci, left, right, gm, pos, t_read in chunk_iterator(source, chunks, prefetch):
-        # Time from the moment we asked the queue for the next chunk until we
-        # actually got it: this is how long the main thread was *blocked* on
-        # I/O. With perfect prefetch this is ~0 (the next chunk is already
-        # waiting in the queue); without prefetch it equals t_read.
-        t_wait = t_read  # serial mode: we did the read ourselves, all of it counts
-        if prefetch > 0:
-            # In prefetch mode the producer already ran the read in the
-            # background; the consumer's blocking time is hidden inside the
-            # queue. We don't have a direct measurement of it without extra
-            # plumbing, so report t_read for transparency (it's wall-clock
-            # spent decompressing this chunk in the producer thread, which
-            # bounds the *worst case* wait if compute is faster than read).
-            pass
+    sum_read, sum_compute = 0.0, 0.0
+    for ci, left, right, gt, pos, t_read in chunk_iterator(source, chunks, prefetch):
         sum_read += t_read
 
-        n_sites = int(gm.shape[0])
+        # gt has shape (0, n_dip, 2) when the genomic interval has no
+        # variants at all (acrocentric arm).
+        if gt.shape[0] == 0:
+            print(f"  chunk {ci+1}/{len(chunks)} [{left/1e6:.1f}-{right/1e6:.1f} Mb]: "
+                  f"no sites (read {t_read:.1f}s)", flush=True)
+            continue
+
+        # Biallelic count is cheap to compute on the host (one byte per
+        # variant); reported in the log line so the totals stay accurate
+        # if there are recurrent-mutation rows in the chunk.
+        n_sites = int((gt[:, 0, 0] >= 0).sum())
         if n_sites == 0:
             print(f"  chunk {ci+1}/{len(chunks)} [{left/1e6:.1f}-{right/1e6:.1f} Mb]: "
-                  f"no sites (read {t_read:.1f}s)")
+                  f"no biallelic sites (read {t_read:.1f}s)", flush=True)
             continue
 
         t_c0 = time.perf_counter()
-        hm = build_hm(gm, pos, left, right, sample_sets)
-        del gm, pos                                   # release host buffer ASAP
+        hm = build_hm(gt, pos, left, right, sample_sets)
+        del gt, pos                                   # release host buffer ASAP
 
         for label, bp in WINDOW_SCALES:
             per_pop = {p: windowed_analysis(
