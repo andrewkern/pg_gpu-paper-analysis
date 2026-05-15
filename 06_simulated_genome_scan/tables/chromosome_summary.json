@@ -2,7 +2,7 @@
   "model": "OutOfAfrica_2T12",
   "genetic_map": "HapMapII_GRCh38",
   "chromosome": "15",
-  "chromosome_length": 101991189,
+  "chromosome_length": 101991176,
   "haplotypes_per_pop": 100000,
   "n_sites": 11638651,
   "garud_subsample": 1000,
@@ -17,20 +17,20 @@
   "windows": {
     "10kb": 8220,
     "100kb": 822,
-    "1mb": 83
+    "1mb": 165
   },
   "genomewide_100kb": {
-    "mean_pi_AFR": 0.0007464001765162733,
-    "mean_pi_EUR": 0.0005445222377749763,
-    "mean_theta_w_AFR": 0.00586784467966232,
-    "mean_theta_w_EUR": 0.005856460981261652,
-    "mean_tajimas_d_AFR": -2.2576910808545434,
-    "mean_tajimas_d_EUR": -2.346162833531513,
-    "mean_normalized_fay_wu_h_AFR": 0.027775980401018474,
-    "mean_normalized_fay_wu_h_EUR": -0.08248739748880378,
-    "mean_fst": 0.16183473043670524,
-    "mean_dxy": 0.0007749879788831173,
-    "mean_da": 0.0001295267717374925,
+    "mean_pi_AFR": 0.0007463995408274448,
+    "mean_pi_EUR": 0.0005445217740201245,
+    "mean_theta_w_AFR": 0.005867839682177826,
+    "mean_theta_w_EUR": 0.005856455993472346,
+    "mean_tajimas_d_AFR": -2.2576910894027047,
+    "mean_tajimas_d_EUR": -2.346162845369407,
+    "mean_normalized_fay_wu_h_AFR": 0.02777597463595823,
+    "mean_normalized_fay_wu_h_EUR": -0.08248740857174956,
+    "mean_fst": 0.1618347300082093,
+    "mean_dxy": 0.0007749873188468315,
+    "mean_da": 0.0001295266614230466,
     "total_segregating_sites_AFR": 5830887.0,
     "total_segregating_sites_EUR": 5819575.0
   }

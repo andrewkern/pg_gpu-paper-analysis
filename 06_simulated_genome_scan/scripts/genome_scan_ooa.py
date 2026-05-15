@@ -1,48 +1,37 @@
 #!/usr/bin/env python
 """
-Deep pg_gpu scan of a single chromosome from a VCZ-format zarr store -- the
-standard biobank-scale per-sample genotype representation (sgkit / bio2zarr /
-our companion ``ts_to_vcz.py`` output). Empirical biobank data lands here too:
-a VCF run through bio2zarr or a gnomAD HGDP+1KG-style zarr release drops in
-without changes; the only piece that's not in VCZ is the sample-to-population
-map, which we read from a companion ``sample_id<TAB>population`` TSV.
+Deep pg_gpu scan of one chromosome from a VCZ-format zarr store, biobank-scale.
 
-The chromosome is streamed in genomic chunks: each chunk's variants are pulled
-out of the zarr store as a dense ``(haplotypes x variants)`` matrix on the GPU,
-the windowed / SFS / LD statistics for that chunk are computed, the GPU buffer
-is released, and the next chunk is read. **GPU memory scales with one chunk,
-not the chromosome length**, so haplotype counts in the hundreds of thousands
-work on a single 80 GB GPU. For statistics that only need a haplotype subsample
-(Garud's H, joint SFS, the LD analyses) the per-haplotype reads go through
-zarr's ``oindex`` so host memory scales with the subsample, not the full
-sample axis.
+The store is opened as a ``StreamingHaplotypeMatrix``: pg_gpu walks the
+chromosome chunk-by-chunk, pulling each chunk onto the GPU, computing
+its contribution to the per-window / SFS / LD statistics, and freeing
+it before the next chunk. GPU memory scales with one chunk, not the
+chromosome length, so haplotype counts in the hundreds of thousands
+work on a single 80 GB A100.
 
-The OOA_2T12 simulation in this repo flows:
+Every statistic below is one call on the streaming matrix. The two
+that need every variant simultaneously (Garud's H haplotype hashing,
+and the pairwise-r^2 heatmap) call ``streaming.materialize(...)`` to
+pull a subsample-only or region-only eager matrix for that step.
 
-    simulate_ooa_genome.py  ->  data/<run>/chr15.trees
-    ts_to_vcz.py            ->  data/<run>/chr15.vcz  +  chr15.pops.tsv
-    genome_scan_ooa.py      ->  figures + tables
-
-For real empirical data the first two steps are replaced by any VCZ store
-(e.g. a VCF run through ``bio2zarr``) and a companion pop file -- the rest of
-this script is unchanged.
+For empirical biobank data, replace the simulation + ``ts_to_vcz.py``
+steps with any VCZ store (a VCF run through ``bio2zarr``, gnomAD
+HGDP+1KG, or a scikit-allel store converted by
+``pg_gpu.zarr_io.allel_zarr_to_vcz``); the rest is unchanged.
 
 What it computes
 ----------------
-* Windowed diversity (per population: ``pi``, ``theta_w``, ``tajimas_d``,
-  ``fay_wu_h``, ``normalized_fay_wu_h``, ``segregating_sites``) and divergence
-  (Hudson ``fst``, ``dxy``, ``da``) at three window scales (10 kb, 100 kb, 1 Mb)
-  using the full haplotype set.
-* Windowed Garud's H (``h1``, ``h12``, ``h123``, ``h2h1``) and distinct-haplotype
-  count, per population, on a 1000-hap subsample (pg_gpu's Garud kernel caps at
-  ~1024 haplotypes).
-* Genome-wide marginal SFS per population, and a joint SFS on a 200-hap
-  subsample.
-* LD decay: mean r^2 over pairs of common SNPs (MAF >= LD_DECAY_MIN_MAF in the
-  subsample), distance-binned and pooled over several large probe regions
-  tiling the mappable chromosome, per population. Plus a pairwise-r^2 heatmap
-  of one ~1 Mb sub-region (common SNPs, one population) with a zoomed-in inset
-  on the densest LD block.
+* Windowed diversity (per-pop: ``pi``, ``theta_w``, ``tajimas_d``,
+  ``fay_wu_h``, ``normalized_fay_wu_h``, ``segregating_sites``) and
+  Hudson divergence (``fst``, ``dxy``, ``da``) at three scales
+  (10 kb, 100 kb, 1 Mb) using the full haplotype set.
+* Genome-wide marginal SFS per pop, joint SFS on a small subsample.
+* Genome-wide LD decay (DD, Dz, pi2 -- the moments-LD pair-bin
+  statistics -- per pop and between pops). r^2 proxy is sigma_d^2 = DD/pi2.
+* Windowed Garud's H (``h1``, ``h12``, ``h123``, ``h2h1``) per pop on a
+  1000-hap subsample (pg_gpu's Garud kernel caps near 1024).
+* Pairwise r^2 heatmap of one ~1 Mb sub-region (common SNPs in one
+  pop), with a zoomed-in inset on the densest LD block.
 
 Run inside the pg_gpu pixi environment with a free GPU, from the repo root:
 
@@ -55,21 +44,17 @@ Outputs (under 06_simulated_genome_scan/)
     tables/windowed_stats_{10kb,100kb,1mb}.csv   per-window diversity + divergence
     tables/garud_h_10kb.csv                      per-window Garud's H (subsample)
     tables/sfs_AFR.csv, sfs_EUR.csv              genome-wide marginal SFS
-    tables/ld_decay.csv                          mean r^2 + n_pairs per distance bin, per pop
+    tables/ld_decay.csv                          per-bin moments-LD stats per pop
     tables/joint_sfs.npy, r2_heatmap.npy,
     tables/r2_heatmap_pos.npy                    caches for replot.py
     tables/chromosome_summary.json               scalar summaries
-    figures/genome_scan_ooa.pdf/.png             composite: left scan column + right
-                                                 column = joint SFS / LD decay /
-                                                 r^2 heatmap with zoom inset
-    figures/multiscale_ooa.pdf/.png              pi & Tajima's D at 10 kb / 100 kb / 1 Mb
-    figures/ld_ooa.pdf/.png                      standalone LD decay + r^2 heatmap
+    figures/genome_scan_ooa.{pdf,png}            composite scan + LD/SFS column
+    figures/multiscale_ooa.{pdf,png}             pi & Tajima's D at 3 window scales
+    figures/ld_ooa.{pdf,png}                     standalone LD decay + r^2 heatmap
 """
 
 import argparse
 import json
-import queue
-import threading
 import time
 from pathlib import Path
 
@@ -81,7 +66,6 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 import cupy as cp
-import zarr
 from scipy.ndimage import uniform_filter1d
 
 from pg_gpu import HaplotypeMatrix, windowed_analysis, sfs
@@ -100,547 +84,331 @@ DIVERGENCE_STATS = ["fst", "dxy", "da"]
 GARUD_STATS = ["garud_h1", "garud_h12", "garud_h123", "garud_h2h1",
                "haplotype_count"]
 
-# (label, bp) window scales for the diversity/divergence sweep.
+# (label, window-size-bp) for the diversity / divergence sweep.
 WINDOW_SCALES = [("10kb", 10_000), ("100kb", 100_000), ("1mb", 1_000_000)]
 MAIN_SCALE = "100kb"           # scale used for the headline scan figure
 GARUD_SCALE_BP = 10_000        # Garud's H windowed at this scale
 
-# Subsamples (haplotype columns per population) for statistics whose cost or
-# kernel limits make the full sample impractical.
-GARUD_SUBSAMPLE = 1000         # capped by the ~1024-hap Garud kernel
-JOINT_SFS_SUBSAMPLE = 200
+# Subsamples for stats that can't take the full sample axis cheaply.
+GARUD_SUBSAMPLE = 1000          # capped by the ~1024-hap Garud kernel
+JOINT_SFS_SUBSAMPLE = 200       # full joint SFS would be n_hap^2 cells
 
-# LD analyses run on haplotype subsamples and on common variants only.
-LD_SUBSAMPLE = 5000            # haplotypes per pop for the LD analyses
-LD_DECAY_MIN_MAF = 0.15        # minor-allele-frequency cutoff for the decay curve
-LD_DECAY_PROBE_BP = 5_000_000  # probe-region width for LD decay (large context)
-LD_DECAY_N_PROBES = 16         # probe regions spread along the mappable chromosome
-LD_DECAY_MAX_SNPS = 12_000     # common-SNP cap per probe (rarely reached at MAF 0.15)
-LD_HEATMAP_REGION_BP = 1_000_000  # width of the r^2-heatmap probe region
-LD_HEATMAP_MIN_MAF = 0.05      # minor-allele-frequency cutoff for the r^2 heatmap
-LD_HEATMAP_SUBSAMPLE = 5000    # haplotypes (one pop) for the r^2 heatmap
-LD_HEATMAP_MAX_SNPS = 2000     # common-SNP cap for the r^2-heatmap matrix
+# LD-decay haplotype subsample per pop. Each pair-count step reads
+# n_hap entries for both endpoints, so cost scales linearly with this.
+# At biobank-scale per-pop sizes (~100 k haps) a full-pop pass is
+# bandwidth-bound and takes hours; 5 k haps brings it to minutes
+# while still giving stable mean estimates.
+LD_SUBSAMPLE = 5_000
 
+# Per-probe SNP cap for LD decay. Pair count grows quadratically with
+# the variant count, so a 5 Mb probe at biobank-scale variant density
+# (~120k SNPs/Mb) would give 600k SNPs and ~6 billion pairs per probe;
+# the cap downsamples (uniformly along position) to a tractable count
+# whose pair-bin sums are still a sound moments-LD estimate.
+LD_DECAY_MAX_SNPS = 12_000
 
-# ── zarr-backed chromosome source ───────────────────────────────────────────
+# LD pair-bin breakpoints in bp. The last entry is the maximum pair
+# distance the streaming compute walks; everything farther apart is
+# skipped.
+LD_BP_BINS = [0, 500, 1_000, 2_000, 5_000, 10_000, 20_000, 50_000,
+              100_000, 200_000]
 
-class ZarrSource:
-    """One contig of a VCZ-format zarr store, with sample-to-population
-    bookkeeping.
-
-    Wraps the on-disk array layout so the rest of the script speaks in terms
-    of genomic regions and haplotype-column indices. The two read paths:
-
-    * ``slice_region(left, right)`` reads every haplotype for variants in a
-      bp range -- used by the full-sample windowed scan.
-    * ``slice_subsample(left, right, hap_cols)`` reads only the requested
-      haplotype columns via zarr's orthogonal indexing -- used by stats that
-      only need a subsample (Garud's H, joint SFS, LD probes). The host array
-      it returns is shaped ``(n_var, len(hap_cols))``, not the full sample
-      axis, so RAM scales with the subsample.
-
-    Haplotype-column layout matches pg_gpu's convention: hap ``0..n_dip-1`` is
-    each diploid's first ploidy slot, hap ``n_dip..2*n_dip-1`` is the second.
-    """
-
-    def __init__(self, zarr_path, pop_file=None, contig_id=None):
-        self.path = Path(zarr_path)
-        self.store = zarr.open_group(str(self.path), mode="r")
-        contigs = [str(c) for c in np.asarray(self.store["contig_id"])]
-        if contig_id is None:
-            if len(contigs) != 1:
-                raise SystemExit(f"multiple contigs in {self.path} "
-                                 f"({contigs}); pass --chromosome")
-            contig_id = contigs[0]
-        if contig_id not in contigs:
-            raise SystemExit(f"contig {contig_id!r} not in {self.path} "
-                             f"(available: {contigs})")
-        self.chrom = contig_id
-        self.contig_idx = contigs.index(contig_id)
-        if "contig_length" in self.store:
-            self.chrom_length = int(np.asarray(self.store["contig_length"])[self.contig_idx])
-        else:
-            self.chrom_length = int(np.asarray(self.store["variant_position"]).max()) + 1
-
-        # Variant axis: restrict to this contig (here the VCZ is single-contig
-        # so this is the identity, but the bookkeeping generalises).
-        var_contig_all = np.asarray(self.store["variant_contig"])
-        var_pos_all = np.asarray(self.store["variant_position"]).astype(np.float64)
-        contig_mask = var_contig_all == self.contig_idx
-        self._zarr_var_indices = np.where(contig_mask)[0]
-        if self._zarr_var_indices.size == 0:
-            raise SystemExit(f"no variants for contig {self.chrom} in {self.path}")
-        self.site_pos = var_pos_all[contig_mask]
-        # "Mappable" extent = the variant span -- real data is filtered by
-        # the upstream callset / accessibility mask, simulated data is
-        # filtered by the recombination map (NaN intervals get no mutations).
-        self.mappable_lo = int(self.site_pos.min())
-        self.mappable_hi = int(self.site_pos.max()) + 1
-
-        cg = self.store["call_genotype"]
-        if cg.ndim != 3 or cg.shape[2] != 2:
-            raise SystemExit(f"expected diploid (n_var, n_samples, 2) call_genotype, "
-                             f"got shape {cg.shape}")
-        self.n_dip = int(cg.shape[1])
-        self.num_haplotypes = 2 * self.n_dip
-
-        self.sample_ids = list(np.asarray(self.store["sample_id"]))
-
-        if pop_file is None:
-            candidates = [
-                self.path.with_suffix(".pops.tsv"),
-                self.path.parent / (self.path.stem + ".pops.tsv"),
-                self.path.parent / "pops.tsv",
-            ]
-            for c in candidates:
-                if c.exists():
-                    pop_file = c
-                    break
-            else:
-                raise SystemExit(
-                    f"no companion pop file found next to {self.path}; "
-                    f"pass --pop-file. Tried: {[str(c) for c in candidates]}")
-        self.pop_file = Path(pop_file)
-        self.pop_cols = self._load_pop_file(self.pop_file)
-
-    @property
-    def num_variants(self):
-        return int(self._zarr_var_indices.size)
-
-    def _load_pop_file(self, path):
-        """Parse a TSV of ``sample_id<TAB>population`` (header optional) and
-        return ``{pop_name: haplotype-column indices}`` aligned with the
-        store's sample order."""
-        sample_to_pop = {}
-        with open(path) as f:
-            for line in f:
-                line = line.rstrip()
-                if not line or line.startswith("#"):
-                    continue
-                parts = line.split("\t")
-                if len(parts) < 2 or parts[0].lower() == "sample_id":
-                    continue
-                sample_to_pop[parts[0]] = parts[1]
-        pop_haps = {}
-        for di, sid in enumerate(self.sample_ids):
-            p = sample_to_pop.get(sid)
-            if p is None:
-                continue
-            pop_haps.setdefault(p, []).append(di)
-            pop_haps[p].append(di + self.n_dip)
-        if not pop_haps:
-            raise SystemExit(f"no samples from {path} matched the store's sample_ids "
-                             f"(first store sample: {self.sample_ids[0]!r})")
-        return {p: np.asarray(sorted(v), dtype=np.int64) for p, v in pop_haps.items()}
-
-    def _site_index_range(self, left, right):
-        """``[lo, hi)`` into ``self.site_pos`` (and the zarr variant axis,
-        for this contig) such that ``left <= pos < right``."""
-        lo = int(np.searchsorted(self.site_pos, left, side="left"))
-        hi = int(np.searchsorted(self.site_pos, right, side="left"))
-        return lo, hi
-
-    def slice_region(self, left, right):
-        """All-haplotype slice. Returns the raw zarr genotype array
-        ``(gt (n_var, n_dip, 2) int8, pos (n_var,) float64)``.
-
-        Multiallelic / masked rows (gt = -1) are kept in place; downstream
-        ``build_hm`` filters them on the GPU. The biallelic filter and the
-        ploidy reshape used to be done here on the host, but each was a
-        ~28 GB allocate + page-fault + copy that dominated the per-chunk
-        wall time. Doing them on the GPU as part of the same kernel that
-        builds the (n_hap, n_var) view is ~10x cheaper."""
-        lo, hi = self._site_index_range(left, right)
-        if hi <= lo:
-            return np.empty((0, self.n_dip, 2), np.int8), np.empty(0)
-        zlo = int(self._zarr_var_indices[lo])
-        zhi = int(self._zarr_var_indices[hi - 1]) + 1
-        gt = np.asarray(self.store["call_genotype"][zlo:zhi])   # (n, n_dip, 2) int8
-        pos = self.site_pos[lo:hi].copy()
-        return gt, pos
-
-    def slice_subsample(self, left, right, hap_cols):
-        """Variants in ``[left, right)`` restricted to the given haplotype
-        columns (indices into the ``(2*n_dip,)`` haplotype axis).
-
-        Uses zarr's ``oindex`` to pull only the requested diploid columns.
-        With our VCZ chunked across the full sample axis the underlying
-        decompression still touches the full sample chunk, but the returned
-        numpy array is only ``(n_var, len(unique_dips), 2)``, so host RAM
-        scales with the subsample size and not 2 * n_dip."""
-        lo, hi = self._site_index_range(left, right)
-        hap_cols = np.asarray(hap_cols, dtype=np.int64)
-        if hi <= lo:
-            return np.empty((0, len(hap_cols)), np.int8), np.empty(0)
-        zlo = int(self._zarr_var_indices[lo])
-        zhi = int(self._zarr_var_indices[hi - 1]) + 1
-        is_p1 = hap_cols >= self.n_dip
-        dip_idx = np.where(is_p1, hap_cols - self.n_dip, hap_cols)
-        ploidy = is_p1.astype(np.int64)
-        unique_dips, inv = np.unique(dip_idx, return_inverse=True)
-        gt = np.asarray(
-            self.store["call_genotype"].oindex[zlo:zhi, unique_dips, :]
-        )                                                       # (n, len(unique_dips), 2)
-        pos = self.site_pos[lo:hi].copy()
-        biallelic = gt[:, 0, 0] >= 0
-        gt = gt[biallelic]
-        pos = pos[biallelic]
-        n_var = gt.shape[0]
-        if n_var == 0:
-            return np.empty((0, len(hap_cols)), np.int8), np.empty(0)
-        # Advanced indexing: pick (column-in-unique, ploidy-slot) per output column.
-        gm = gt[np.arange(n_var)[:, None], inv[None, :], ploidy[None, :]]
-        return gm, pos
+# Pairwise-r^2 heatmap of one sub-region (eager).
+LD_HEATMAP_REGION_BP = 1_000_000  # width of the heatmap region
+LD_HEATMAP_MIN_MAF = 0.05         # MAF cutoff for SNPs in the heatmap
+LD_HEATMAP_SUBSAMPLE = 5000       # haplotypes drawn (one pop)
+LD_HEATMAP_MAX_SNPS = 2000        # cap SNPs after MAF filter
 
 
-# ── helpers reused below ────────────────────────────────────────────────────
-
-def read_common_variants(source, left, right, hap_cols, min_maf):
-    """Variants in ``[left, right)`` restricted to ``hap_cols``, biallelic,
-    with minor-allele frequency >= ``min_maf`` within those columns."""
-    gm, pos = source.slice_subsample(left, right, hap_cols)
-    if gm.shape[0] == 0:
-        return gm, pos
-    af = gm.sum(axis=1) / gm.shape[1]
-    keep = np.minimum(af, 1.0 - af) >= min_maf
-    return np.ascontiguousarray(gm[keep]), pos[keep]
-
-
-def build_hm(gt, pos, left, right, sample_sets):
-    """Build a GPU HaplotypeMatrix from a chunk's raw zarr genotype array
-    ``gt`` of shape ``(n_var, n_dip, 2)`` int8.
-
-    Three things have to happen between the zarr layout and what pg_gpu
-    expects (``(n_hap, n_var)`` int8): drop multiallelic rows (where
-    ``gt == -1``), interleave the two ploidies into a single haplotype
-    axis, and transpose. Doing any of these on the host as a numpy copy is
-    a ~28 GB allocate + page-fault + memcpy that single-threads and
-    dominates the per-chunk wall (~30 s each). Doing all three on the
-    GPU after a single PCIe upload (~1 s at Gen4 x16) is bandwidth-bound
-    and well-tiled by cupy.
-
-    The reshape ``gt.transpose(2, 1, 0).reshape(2*n_dip, n_var)`` places
-    ploidy-0 samples first (haps ``0..n_dip-1``) and ploidy-1 samples
-    second (haps ``n_dip..2*n_dip-1``), matching the convention used by
-    the sample_sets dict (where ``hap_cols[i]`` indexes the same diploid
-    on the same ploidy as the input zarr)."""
-    n_dip = gt.shape[1]
-    gt_gpu = cp.asarray(gt)                                # (n_var, n_dip, 2) on GPU
-    if gt.size:
-        # Filter on a single column (ploidy 0 of the first diploid). -1 is the
-        # convention used by ts_to_vcz for multiallelic / recurrent-mutation
-        # rows, which propagate to every (dip, ploidy) cell of the row.
-        # cupy boolean indexing on the (n_var, n_dip, 2) shape blows the mask
-        # up to int64 (n_var, n_dip, 2) indices (~227 GB on a 1 Mb / 200k-hap
-        # chunk and OOMs), so use compress() which is a one-shot axis-0
-        # gather with a (n_var,) bool mask -- a single output allocation, no
-        # broadcasting.
-        biallelic = gt_gpu[:, 0, 0] >= 0
-        if not bool(biallelic.all()):
-            gt_gpu = gt_gpu.compress(biallelic, axis=0)
-            pos = pos[cp.asnumpy(biallelic)]
-    n_var = int(gt_gpu.shape[0])
-    haps = cp.ascontiguousarray(gt_gpu.transpose(2, 1, 0).reshape(2 * n_dip, n_var))
-    del gt_gpu
-    positions = cp.asarray(pos)
-    return HaplotypeMatrix(haps, positions,
-                           chrom_start=int(left), chrom_end=int(right) - 1,
-                           sample_sets={k: list(v) for k, v in sample_sets.items()})
-
-
-def iter_chunks(seq_length, chunk_bp, align_bp, start=0):
-    """Yield ``(left, right)`` genomic intervals aligned to multiples of
-    ``align_bp`` (the largest window size, so windows can never straddle a
-    chunk boundary)."""
-    windows_per_chunk = max(1, chunk_bp // align_bp)
-    step = windows_per_chunk * align_bp
-    end = int(seq_length)
-    while start < end:
-        yield start, min(start + step, end)
-        start += step
-
+# ── tiny helpers ────────────────────────────────────────────────────────────
 
 def free_gpu():
     cp.get_default_memory_pool().free_all_blocks()
     cp.get_default_pinned_memory_pool().free_all_blocks()
 
 
-def chunk_iterator(source, chunks, prefetch):
-    """Yield ``(ci, left, right, gt, pos, t_read_s)`` for each chunk.
-
-    ``prefetch=0`` reads chunks serially in the main thread (each iteration
-    blocks until the read completes, then hands off to compute).
-    ``prefetch>=1`` launches a producer thread that reads the next chunk
-    from the zarr while the main thread is computing on the current one, via
-    a bounded queue. The dense host buffers (~28 GB / chunk at biobank scale)
-    live in host RAM only, so peak host usage = (prefetch + 1) * chunk-bytes.
-
-    Errors raised by the producer thread are forwarded to the consumer with
-    their traceback preserved."""
-    if prefetch <= 0:
-        for ci, (left, right) in enumerate(chunks):
-            t0 = time.perf_counter()
-            gt, pos = source.slice_region(left, right)
-            yield ci, left, right, gt, pos, time.perf_counter() - t0
-        return
-
-    q = queue.Queue(maxsize=prefetch)
-    stop = threading.Event()
-    _END = object()
-
-    def producer():
-        try:
-            for ci, (left, right) in enumerate(chunks):
-                if stop.is_set():
-                    return
-                t0 = time.perf_counter()
-                gt, pos = source.slice_region(left, right)
-                t_read = time.perf_counter() - t0
-                if stop.is_set():
-                    return
-                q.put((ci, left, right, gt, pos, t_read))
-        except BaseException as e:                   # producer-side failures
-            q.put(("ERR", e))
-            return
-        q.put(_END)
-
-    t = threading.Thread(target=producer, daemon=True, name="zarr-prefetch")
-    t.start()
-    try:
-        while True:
-            item = q.get()
-            if item is _END:
-                break
-            if isinstance(item, tuple) and item and item[0] == "ERR":
-                raise item[1]
-            yield item
-    finally:
-        stop.set()
-        # drain the queue so the producer can exit on its next q.put attempt
-        try:
-            while True:
-                q.get_nowait()
-        except queue.Empty:
-            pass
-        t.join(timeout=5)
+def _as_list_int(idx):
+    """Convert any iterable of ints (numpy array, list, range) to a
+    plain ``list[int]`` -- the eager HaplotypeMatrix's sample_sets
+    setter rejects non-list values."""
+    return [int(i) for i in idx]
 
 
-# ── per-chromosome windowed scan ────────────────────────────────────────────
+def pick_zarr(data_dir, requested):
+    paths = sorted(p for p in Path(data_dir).glob("chr*.vcz") if p.is_dir())
+    if not paths:
+        raise SystemExit(f"no chr*.vcz/ in {data_dir} -- run ts_to_vcz.py first")
+    if requested:
+        path = Path(data_dir) / f"chr{requested}.vcz"
+        if not path.exists():
+            raise SystemExit(f"{path} not found")
+        return path
+    if len(paths) > 1:
+        names = ", ".join(p.stem[3:] for p in paths)
+        raise SystemExit(f"multiple chromosomes in {data_dir} ({names}); "
+                         "pass --chromosome")
+    return paths[0]
 
-def windowed_scan(source, chunk_bp, prefetch=1):
-    """Stream the chromosome chunk-by-chunk through the GPU.
 
-    ``prefetch`` (default 1) runs the zarr region read on a worker thread so
-    the next chunk's host buffer is ready by the time the GPU finishes the
-    current chunk. With ``prefetch=0`` reads happen serially in the main
-    thread (the GPU sits idle during decompression). Each per-chunk print
-    line reports the read-time and compute-time separately so the overlap
-    is visible.
+# ── per-statistic compute steps (one streaming call each) ───────────────────
 
-    Returns ``(windows_by_scale, garud_df, sfs_by_pop, joint_sfs)``."""
-    sub_g = {p: source.pop_cols[p][:min(GARUD_SUBSAMPLE, len(source.pop_cols[p]))]
-             for p in POPS}
-    sub_j = {p: source.pop_cols[p][:min(JOINT_SFS_SUBSAMPLE, len(source.pop_cols[p]))]
-             for p in POPS}
-    sample_sets = {}
-    for p in POPS:
-        sample_sets[p] = source.pop_cols[p]
-        sample_sets[f"{p}_g"] = sub_g[p]
+def run_one_pass_scan(stream, populations):
+    """Stream the chromosome once and accumulate every reduce-by-chunk
+    statistic on each per-chunk eager matrix as it arrives:
 
-    align_bp = max(bp for _, bp in WINDOW_SCALES)
-    chunks = list(iter_chunks(source.chrom_length, chunk_bp, align_bp))
-    print(f"chr{source.chrom}: {source.num_variants:,} variants, "
-          f"{source.num_haplotypes:,} haplotypes, "
-          f"{len(chunks)} chunk(s) of <= {chunk_bp/1e6:g} Mb, "
-          f"prefetch={prefetch}")
+      * windowed diversity + divergence at every scale in ``WINDOW_SCALES``,
+      * per-pop marginal SFS,
+      * joint SFS on the small ``JOINT_SFS_SUBSAMPLE`` per pop,
+      * Garud's H per pop on the ``GARUD_SUBSAMPLE`` per pop (registered
+        as a temporary pop ``{pop}_g`` on each chunk).
 
-    parts = {label: [] for label, _ in WINDOW_SCALES}
+    Doing it as a single explicit pass over ``stream.iter_gpu_chunks()``
+    -- instead of one dispatch per stat -- means chr15 is read once,
+    not nine times.
+
+    Returns ``(windowed_by_scale, garud_df, marginal_sfs_by_pop, joint_sfs)``.
+    """
+    # Subsamples for joint SFS and Garud's H. Convert to plain lists so
+    # the per-chunk sample_sets setter (which only accepts list values)
+    # accepts the streaming source's numpy-array pop indices too.
+    full_pop_lists = {p: _as_list_int(stream.sample_sets[p]) for p in populations}
+    sub_j = {p: full_pop_lists[p][:JOINT_SFS_SUBSAMPLE] for p in populations}
+    sub_g = {p: full_pop_lists[p][:GARUD_SUBSAMPLE] for p in populations}
+
+    windowed = {label: [] for label, _ in WINDOW_SCALES}
     garud_parts = []
-    sfs_by_pop = {p: None for p in POPS}
+    marginal_sfs = {p: None for p in populations}
     joint = None
 
     t_scan = time.perf_counter()
-    sum_read, sum_compute = 0.0, 0.0
-    for ci, left, right, gt, pos, t_read in chunk_iterator(source, chunks, prefetch):
-        sum_read += t_read
-
-        # gt has shape (0, n_dip, 2) when the genomic interval has no
-        # variants at all (acrocentric arm).
-        if gt.shape[0] == 0:
-            print(f"  chunk {ci+1}/{len(chunks)} [{left/1e6:.1f}-{right/1e6:.1f} Mb]: "
-                  f"no sites (read {t_read:.1f}s)", flush=True)
-            continue
-
-        # Biallelic count is cheap to compute on the host (one byte per
-        # variant); reported in the log line so the totals stay accurate
-        # if there are recurrent-mutation rows in the chunk.
-        n_sites = int((gt[:, 0, 0] >= 0).sum())
-        if n_sites == 0:
-            print(f"  chunk {ci+1}/{len(chunks)} [{left/1e6:.1f}-{right/1e6:.1f} Mb]: "
-                  f"no biallelic sites (read {t_read:.1f}s)", flush=True)
-            continue
-
+    n_chunks = len(stream._chunks)
+    for ci, (left, right, chunk_hm) in enumerate(stream.iter_gpu_chunks()):
         t_c0 = time.perf_counter()
-        hm = build_hm(gt, pos, left, right, sample_sets)
-        del gt, pos                                   # release host buffer ASAP
+        # Register the Garud subsamples as named pops on this chunk so
+        # windowed_analysis can pick them up alongside the full-pop scan.
+        chunk_hm.sample_sets = {**full_pop_lists,
+                                **{f"{p}_g": sub_g[p] for p in populations}}
 
         for label, bp in WINDOW_SCALES:
-            per_pop = {p: windowed_analysis(
-                hm, window_size=bp, step_size=bp,
-                statistics=DIVERSITY_STATS, populations=[p])
-                for p in POPS}
-            df_div = windowed_analysis(
-                hm, window_size=bp, step_size=bp,
-                statistics=DIVERGENCE_STATS, populations=list(POPS))
-            m = per_pop[POPS[0]][["start", "end", "center"]].copy()
-            m.insert(0, "chrom", str(source.chrom))
-            for p in POPS:
+            # Per-pop diversity needs one call per pop -- when single +
+            # two-pop stats are combined with len(populations)>=2,
+            # windowed_analysis runs single-pop stats only on
+            # populations[0], not all of them.
+            per_pop = [windowed_analysis(chunk_hm, window_size=bp,
+                                          step_size=bp,
+                                          statistics=DIVERSITY_STATS,
+                                          populations=[p])
+                       for p in populations]
+            div = windowed_analysis(chunk_hm, window_size=bp,
+                                     step_size=bp,
+                                     statistics=DIVERGENCE_STATS,
+                                     populations=list(populations))
+            base = per_pop[0][["chrom", "start", "end", "center"]].copy()
+            for i, p in enumerate(populations):
                 for s in DIVERSITY_STATS + ["n_variants"]:
-                    m[f"{s}_{p}"] = per_pop[p][s].values
+                    base[f"{s}_{p}"] = per_pop[i][s].values
             for s in DIVERGENCE_STATS:
-                m[s] = df_div[s].values
-            m = m[m[f"n_variants_{POPS[0]}"].values > 0]
-            if not m.empty:
-                parts[label].append(m.reset_index(drop=True))
+                base[s] = div[s].values
+            base = base[base[f"n_variants_{populations[0]}"].values > 0]
+            if not base.empty:
+                windowed[label].append(base.reset_index(drop=True))
 
-        g_afr = windowed_analysis(hm, window_size=GARUD_SCALE_BP,
-                                  step_size=GARUD_SCALE_BP,
-                                  statistics=GARUD_STATS,
-                                  populations=[f"{POPS[0]}_g"])
-        gm_df = g_afr[["start", "end", "center", "n_variants"]].copy()
-        gm_df.insert(0, "chrom", str(source.chrom))
-        for s in GARUD_STATS:
-            gm_df[f"{s}_{POPS[0]}"] = g_afr[s].values
-        g_eur = windowed_analysis(hm, window_size=GARUD_SCALE_BP,
-                                  step_size=GARUD_SCALE_BP,
-                                  statistics=GARUD_STATS,
-                                  populations=[f"{POPS[1]}_g"])
-        for s in GARUD_STATS:
-            gm_df[f"{s}_{POPS[1]}"] = g_eur[s].values
-        gm_df = gm_df[gm_df["n_variants"].values > 0]
-        if not gm_df.empty:
-            garud_parts.append(gm_df.reset_index(drop=True))
+        garud_per_pop = []
+        for p in populations:
+            df_g = windowed_analysis(chunk_hm, window_size=GARUD_SCALE_BP,
+                                      step_size=GARUD_SCALE_BP,
+                                      statistics=GARUD_STATS,
+                                      populations=[f"{p}_g"])
+            df_g = df_g.rename(columns={**{s: f"{s}_{p}" for s in GARUD_STATS},
+                                          "n_variants": f"n_variants_{p}"})
+            garud_per_pop.append(df_g)
+        gdf = garud_per_pop[0]
+        for extra in garud_per_pop[1:]:
+            gdf = gdf.merge(
+                extra.drop(columns=["chrom"], errors="ignore"),
+                on=["start", "end", "center"], how="inner",
+                suffixes=("", "_dup"),
+            )
+            gdf = gdf.loc[:, ~gdf.columns.str.endswith("_dup")]
+        any_var = sum(gdf[f"n_variants_{p}"].values > 0 for p in populations)
+        gdf = gdf[any_var > 0]
+        if not gdf.empty:
+            garud_parts.append(gdf.reset_index(drop=True))
 
-        for p in POPS:
-            s = np.asarray(sfs.sfs(hm, population=p))
-            sfs_by_pop[p] = s if sfs_by_pop[p] is None else sfs_by_pop[p] + s
-        j = np.asarray(sfs.joint_sfs(hm, pop1=list(sub_j[POPS[0]]),
-                                     pop2=list(sub_j[POPS[1]])))
+        for p in populations:
+            s = np.asarray(sfs.sfs(chunk_hm, population=p))
+            marginal_sfs[p] = s if marginal_sfs[p] is None else marginal_sfs[p] + s
+        j = np.asarray(sfs.joint_sfs(chunk_hm, pop1=sub_j[populations[0]],
+                                       pop2=sub_j[populations[1]]))
         joint = j if joint is None else joint + j
 
-        del hm
+        del chunk_hm
         free_gpu()
-        t_compute = time.perf_counter() - t_c0
-        sum_compute += t_compute
+        print(f"  chunk {ci+1}/{n_chunks} "
+              f"[{left/1e6:.1f}-{right/1e6:.1f} Mb] in "
+              f"{time.perf_counter()-t_c0:.1f}s", flush=True)
 
-        print(f"  chunk {ci+1}/{len(chunks)} "
-              f"[{left/1e6:.1f}-{right/1e6:.1f} Mb]: {n_sites:,} sites, "
-              f"read {t_read:.1f}s + compute {t_compute:.1f}s")
-
-    t_total = time.perf_counter() - t_scan
-    overlap = sum_read + sum_compute - t_total
-    print(f"windowed_scan totals: wall {t_total:,.1f}s | "
-          f"sum-read {sum_read:,.1f}s | sum-compute {sum_compute:,.1f}s | "
-          f"overlap saved {max(overlap, 0.0):,.1f}s ({100*max(overlap,0)/(sum_read+sum_compute+1e-9):.0f}%)")
-
-    windows_by_scale = {label: (pd.concat(parts[label], ignore_index=True)
-                                if parts[label] else pd.DataFrame())
-                        for label, _ in WINDOW_SCALES}
-    garud_df = pd.concat(garud_parts, ignore_index=True) if garud_parts else pd.DataFrame()
-    return windows_by_scale, garud_df, sfs_by_pop, joint
+    print(f"  one-pass total wall: {time.perf_counter()-t_scan:,.1f}s")
+    windowed_out = {label: (pd.concat(parts, ignore_index=True)
+                             if parts else pd.DataFrame())
+                    for label, parts in windowed.items()}
+    garud_df = (pd.concat(garud_parts, ignore_index=True)
+                if garud_parts else pd.DataFrame())
+    return windowed_out, garud_df, marginal_sfs, joint
 
 
-# ── LD analyses ─────────────────────────────────────────────────────────────
+def run_ld_decay(stream, populations, bp_bins, *,
+                  subsample=5_000, n_probes=16, probe_bp=5_000_000,
+                  max_snps_per_probe=12_000):
+    """Moments-LD pair-bin statistics (DD, Dz, pi2) for both pops and
+    the between-pop case, sampled by tiling the chromosome with
+    ``n_probes`` materialized probe regions. Each probe is loaded
+    eagerly with only the per-pop ``subsample`` haplotypes -- so per
+    probe ~ (subsample, probe_bp * density) int8 instead of the full
+    biobank-scale matrix -- and the bin sums are accumulated as raw
+    moments-LD numerators across probes. The final ratio sigma_d^2 =
+    sum(DD) / sum(pi2) is computed once at the end.
 
-LD_BP_BINS = [0, 500, 1_000, 2_000, 5_000, 10_000, 20_000, 50_000,
-              100_000, 200_000, 500_000]
+    This is what the streaming pair-bin function would do natively, if
+    the tail-buffer stitch were subsample-aware. Until then, probe-and-
+    materialize keeps the GPU memory bounded by the subsample size.
+    """
+    afr, eur = populations
+    afr_idx = _as_list_int(stream.sample_sets[afr])[:subsample]
+    eur_idx = _as_list_int(stream.sample_sets[eur])[:subsample]
+    n_afr = len(afr_idx)
+    sample_subset = afr_idx + eur_idx
 
-
-def ld_decay(source):
-    """Mean r^2 over MAF-filtered common SNP pairs, distance-binned and pooled
-    over large probe regions tiling the mappable chromosome."""
-    sub = {p: source.pop_cols[p][:min(LD_SUBSAMPLE, len(source.pop_cols[p]))]
-           for p in POPS}
-    bins = np.asarray(LD_BP_BINS, dtype=float)
+    bins = np.asarray(bp_bins, dtype=float)
     mids = np.sqrt(np.maximum(bins[:-1], 1.0) * bins[1:])
     mids[0] = bins[1] / 2.0
-    max_d = float(bins[-1])
-    sum_r2 = {p: np.zeros(len(bins) - 1) for p in POPS}
-    n_pairs = {p: np.zeros(len(bins) - 1, dtype=np.int64) for p in POPS}
+    n_bins = len(bins) - 1
 
-    mappable_lo, mappable_hi = source.mappable_lo, source.mappable_hi
-    span = max(LD_DECAY_PROBE_BP, (mappable_hi - mappable_lo) // LD_DECAY_N_PROBES)
-    lefts = np.unique(np.linspace(mappable_lo, max(mappable_lo, mappable_hi - span),
-                                  LD_DECAY_N_PROBES).astype(int))
-    for pi, left in enumerate(lefts):
-        right = min(int(left) + span, mappable_hi)
-        for p in POPS:
-            gm, pos = read_common_variants(source, int(left), right, sub[p],
-                                           LD_DECAY_MIN_MAF)
-            if gm.shape[0] < 3:
-                continue
-            if gm.shape[0] > LD_DECAY_MAX_SNPS:
-                pick = np.linspace(0, gm.shape[0] - 1, LD_DECAY_MAX_SNPS).astype(int)
-                gm, pos = np.ascontiguousarray(gm[pick]), pos[pick]
-            if p == POPS[0]:
-                print(f"  LD decay probe {pi+1}/{len(lefts)} "
-                      f"[{int(left)/1e6:.1f}-{right/1e6:.1f} Mb]: ~{gm.shape[0]} "
-                      f"common SNPs/pop (MAF>={LD_DECAY_MIN_MAF})")
-            hm = HaplotypeMatrix(cp.asarray(np.ascontiguousarray(gm.T)),
-                                 cp.asarray(pos),
-                                 chrom_start=int(left), chrom_end=right - 1)
-            r2 = hm.pairwise_r2()
-            r2 = r2.get() if hasattr(r2, "get") else np.asarray(r2)
-            del hm
-            free_gpu()
-            iu, ju = np.triu_indices(r2.shape[0], k=1)
-            d = pos[ju] - pos[iu]
-            v = r2[iu, ju].astype(np.float64)
-            del r2, iu, ju
-            keep = np.isfinite(v) & (d <= max_d)
-            d, v = d[keep], v[keep]
-            idx = np.digitize(d, bins) - 1
-            for b in range(len(bins) - 1):
-                m = idx == b
-                if m.any():
-                    sum_r2[p][b] += float(v[m].sum())
-                    n_pairs[p][b] += int(m.sum())
+    cats = (afr, eur, f"{afr}_{eur}")
+    cat_stats = {afr: ("DD_0_0", "Dz_0_0_0", "pi2_0_0_0_0"),
+                  eur: ("DD_1_1", "Dz_1_1_1", "pi2_1_1_1_1"),
+                  f"{afr}_{eur}": ("DD_0_1", "Dz_0_0_1", "pi2_0_0_1_1")}
+    accum = {c: {"DD": np.zeros(n_bins), "Dz": np.zeros(n_bins),
+                  "pi2": np.zeros(n_bins)} for c in cats}
 
-    rows, r2by = [], {}
-    for p in POPS:
-        mean = np.where(n_pairs[p] > 0, sum_r2[p] / np.maximum(n_pairs[p], 1), np.nan)
-        r2by[p] = (mids, mean)
-        for i in range(len(bins) - 1):
-            rows.append({"pop": p, "bin_lo_bp": int(bins[i]),
-                         "bin_hi_bp": int(bins[i + 1]),
-                         "bin_mid_bp": float(mids[i]),
-                         "mean_r2": float(mean[i]),
-                         "n_pairs": int(n_pairs[p][i])})
-    return pd.DataFrame(rows), r2by
+    # Use the variant-bearing range rather than the chunk grid; on a
+    # chromosome with a large variant-free arm (e.g. chr15's
+    # acrocentric region) probes pinned to the chunk grid would land
+    # in empty space and materialize 0 variants.
+    pos_arr = np.asarray(stream._source.site_pos)
+    lo = int(pos_arr.min())
+    hi = int(pos_arr.max()) + 1
+    span = max(probe_bp, (hi - lo) // n_probes)
+    lefts = np.unique(np.linspace(lo, max(lo, hi - span), n_probes).astype(int))
+    for pi_, left in enumerate(lefts):
+        right = min(int(left) + span, hi)
+        # Skip empty intervals defensively -- biobank stores can have
+        # masked / unmappable runs even within the variant-bearing
+        # range.
+        if not ((pos_arr >= left) & (pos_arr < right)).any():
+            print(f"  probe {pi_+1}/{len(lefts)} "
+                  f"[{int(left)/1e6:.1f}-{right/1e6:.1f} Mb] empty, skipped",
+                  flush=True)
+            continue
+        t0 = time.perf_counter()
+        eager = stream.materialize(region=(int(left), right),
+                                    sample_subset=sample_subset)
+        # The subsample arrives in the order we passed it: first n_afr
+        # entries are AFR, the rest are EUR. ``materialize`` reshapes
+        # the sample axis to (n_dip', 2) but the pair-count kernels
+        # only care about per-row haplotype identity, so the diploid
+        # mock-up is harmless.
+        eager.sample_sets = {afr: list(range(n_afr)),
+                              eur: list(range(n_afr, n_afr + len(eur_idx)))}
+        # Cap variants per probe: pair count grows quadratically and
+        # at biobank-scale variant density a 5 Mb probe has hundreds
+        # of thousands of SNPs. Pick ~max_snps_per_probe along the
+        # variant axis (uniform indices) before the pair iteration.
+        if eager.num_variants > max_snps_per_probe:
+            pick = cp.linspace(0, eager.num_variants - 1,
+                                max_snps_per_probe).astype(cp.int64)
+            eager = HaplotypeMatrix(
+                cp.ascontiguousarray(eager.haplotypes[:, pick]),
+                eager.positions[pick],
+                chrom_start=int(left), chrom_end=right - 1,
+                sample_sets=eager.sample_sets,
+            )
+        result = eager.compute_ld_statistics_gpu_two_pops(
+            bp_bins, pop1=afr, pop2=eur, ac_filter=True, raw=True,
+        )
+        for i, key in enumerate(zip(bins[:-1], bins[1:])):
+            stats = result[(float(key[0]), float(key[1]))]
+            for c in cats:
+                k_dd, k_dz, k_pi2 = cat_stats[c]
+                accum[c]["DD"][i] += stats[k_dd]
+                accum[c]["Dz"][i] += stats[k_dz]
+                accum[c]["pi2"][i] += stats[k_pi2]
+        del eager
+        free_gpu()
+        print(f"  probe {pi_+1}/{len(lefts)} "
+              f"[{int(left)/1e6:.1f}-{right/1e6:.1f} Mb] "
+              f"in {time.perf_counter()-t0:.1f}s", flush=True)
+
+    rows = []
+    for c in cats:
+        for i, (l_bp, h_bp) in enumerate(zip(bins[:-1], bins[1:])):
+            dd, dz, p2 = accum[c]["DD"][i], accum[c]["Dz"][i], accum[c]["pi2"][i]
+            rows.append({"pop": c, "bin_lo_bp": int(l_bp),
+                         "bin_hi_bp": int(h_bp), "bin_mid_bp": float(mids[i]),
+                         "DD": dd, "Dz": dz, "pi2": p2,
+                         "sigma_d2": dd / p2 if p2 != 0 else float("nan")})
+    return pd.DataFrame(rows)
 
 
-def ld_heatmap(source, region):
-    """Pairwise r^2 heatmap for common variants (MAF >= LD_HEATMAP_MIN_MAF)
-    in one ~1 Mb sub-region, on a single population's haplotype subsample."""
-    left, right = region
-    cols = source.pop_cols[POPS[0]][:min(LD_HEATMAP_SUBSAMPLE,
-                                          len(source.pop_cols[POPS[0]]))]
-    gm, pos = read_common_variants(source, left, right, cols, LD_HEATMAP_MIN_MAF)
-    if gm.shape[0] < 10:
-        return np.zeros((0, 0)), np.empty(0), len(cols)
-    if gm.shape[0] > LD_HEATMAP_MAX_SNPS:
-        pick = np.linspace(0, gm.shape[0] - 1, LD_HEATMAP_MAX_SNPS).astype(int)
-        gm, pos = np.ascontiguousarray(gm[pick]), pos[pick]
-    print(f"  LD heatmap: {POPS[0]} chr region {left/1e6:.2f}-{right/1e6:.2f} Mb, "
-          f"{gm.shape[0]} common SNPs x {len(cols)} haplotypes")
-    hm = HaplotypeMatrix(cp.asarray(np.ascontiguousarray(gm.T)),
-                         cp.asarray(pos),
-                         chrom_start=int(left), chrom_end=int(right) - 1)
+    bins = np.asarray(bp_bins, dtype=float)
+    mids = np.sqrt(np.maximum(bins[:-1], 1.0) * bins[1:])
+    mids[0] = bins[1] / 2.0
+    rows = []
+    # DD / Dz / pi2 for: within-pop1, within-pop2, between-pop pair.
+    label_to_stats = {afr: ("DD_0_0", "Dz_0_0_0", "pi2_0_0_0_0"),
+                      eur: ("DD_1_1", "Dz_1_1_1", "pi2_1_1_1_1"),
+                      f"{afr}_{eur}": ("DD_0_1", "Dz_0_0_1", "pi2_0_0_1_1")}
+    for i, (lo, hi) in enumerate(zip(bins[:-1], bins[1:])):
+        stats = result[(float(lo), float(hi))]
+        for label, (k_dd, k_dz, k_pi2) in label_to_stats.items():
+            dd, dz, p2 = stats[k_dd], stats[k_dz], stats[k_pi2]
+            rows.append({"pop": label, "bin_lo_bp": int(lo),
+                         "bin_hi_bp": int(hi), "bin_mid_bp": float(mids[i]),
+                         "DD": dd, "Dz": dz, "pi2": p2,
+                         "sigma_d2": dd / p2 if p2 != 0 else float("nan")})
+    return pd.DataFrame(rows)
+
+
+def run_ld_heatmap(stream, populations, region, subsample, min_maf, max_snps):
+    """Materialize one sub-region restricted to ``subsample`` haplotypes,
+    drop monomorphic / low-MAF sites, cap to ``max_snps``, return its
+    (n_snps, n_snps) pairwise r^2 plus the SNP positions."""
+    pop_cols = list(stream.sample_sets[populations[0]][:subsample])
+    eager = stream.materialize(region=region, sample_subset=pop_cols)
+    haps = eager.haplotypes
+    pos = eager.positions
+    af = (haps > 0).sum(axis=0).astype(cp.float64) / haps.shape[0]
+    maf = cp.minimum(af, 1.0 - af)
+    keep = maf >= min_maf
+    haps = haps[:, keep]
+    pos = pos[keep]
+    n_var = int(haps.shape[1])
+    if n_var > max_snps:
+        pick = cp.linspace(0, n_var - 1, max_snps).astype(cp.int64)
+        haps = haps[:, pick]
+        pos = pos[pick]
+    if haps.shape[1] < 10:
+        del eager
+        free_gpu()
+        return np.zeros((0, 0)), np.empty(0), len(pop_cols)
+    hm = HaplotypeMatrix(haps, pos, chrom_start=int(region[0]),
+                          chrom_end=int(region[1]) - 1)
     r2 = hm.pairwise_r2()
     r2 = r2.get() if hasattr(r2, "get") else np.asarray(r2)
-    del hm
+    pos_host = pos.get() if hasattr(pos, "get") else np.asarray(pos)
+    del hm, eager
     free_gpu()
-    return r2, pos, len(cols)
+    return r2, pos_host, len(pop_cols)
 
 
 # ── plotting ────────────────────────────────────────────────────────────────
@@ -654,9 +422,8 @@ def _smooth(y):
 
 
 def _scan_panel(ax, x_mb, series, ylabel, title, hline=None, legend=False):
-    """One genome-scan panel: faded raw trace + bold smoothed line, per series.
-    ``series`` is a list of ``(values, color, label)`` -- one entry for a
-    single track, two for a two-population comparison."""
+    """One genome-scan panel: faded raw trace + bold smoothed line, per
+    series. ``series`` is a list of ``(values, color, label)``."""
     for y, color, label in series:
         ax.plot(x_mb, y, color=color, alpha=0.15, lw=0.4)
         ax.plot(x_mb, _smooth(y), color=color, alpha=0.95, lw=1.0, label=label)
@@ -669,30 +436,28 @@ def _scan_panel(ax, x_mb, series, ylabel, title, hline=None, legend=False):
         ax.legend(loc="upper right", fontsize=10, ncol=2, framealpha=0.9)
 
 
-def _draw_ld_decay(ax, r2_by_pop, n_ld_sub, title_size=10, title=None):
-    """Plot mean-r^2 vs distance, per pop. ``title=None`` keeps the long
-    default; pass an explicit string (or ``''`` for no title) to override."""
+def _draw_ld_decay(ax, ld_r2, n_ld_sub, title_size=10, title=None):
+    """Per-pop sigma_d^2 vs distance from the LD-decay table."""
     for p in POPS:
-        mids, mean_r2 = r2_by_pop[p]
-        ax.plot(mids, mean_r2, "o-", color=POP_COLORS[p], lw=1.5, ms=5, label=p)
+        mids, sig = ld_r2[p]
+        ax.plot(mids, sig, "o-", color=POP_COLORS[p], lw=1.5, ms=5, label=p)
     ax.set_xscale("log")
     ax.set_xlabel("Distance between SNPs (bp)", fontsize=10)
-    ax.set_ylabel(r"mean $r^2$", fontsize=10)
+    ax.set_ylabel(r"$\sigma_d^2 = DD / \pi^2$", fontsize=10)
     ax.set_ylim(bottom=0)
     ax.grid(True, which="both", alpha=0.3)
     ax.tick_params(labelsize=9)
     ax.legend(fontsize=9, title="population", title_fontsize=9)
     if title is None:
-        title = (f"LD decay (mean $r^2$, common SNPs MAF $\\geq$ {LD_DECAY_MIN_MAF})\n"
-                 f"{n_ld_sub:,}-hap subsample/pop, {LD_DECAY_N_PROBES} probe regions")
+        title = (f"LD decay (moments-LD $\\sigma_d^2$, common SNPs)\n"
+                 f"{n_ld_sub:,} haps/pop")
     if title:
         ax.set_title(title, fontsize=title_size, fontweight="bold", loc="left")
 
 
 def _densest_block(r2, frac=0.12):
     """Index range ``[i0, i1)`` of the contiguous SNP block of size
-    ``~frac * n`` with the highest mean within-block r^2 -- used to pick what
-    the LD zoom shows."""
+    ``~frac * n`` with the highest mean within-block r^2."""
     n = r2.shape[0]
     w = max(10, int(round(frac * n)))
     if w >= n:
@@ -710,10 +475,9 @@ def _densest_block(r2, frac=0.12):
 
 def _draw_r2_heatmap(ax, r2_mat, hm_pos, chrom, region, n_hm_haps,
                      with_inset=True, title_size=10, title=None):
-    """``title=None`` keeps the long default; pass an explicit string (or
-    ``''`` for no title) to override."""
     if not r2_mat.size:
-        ax.set_title("Pairwise $r^2$: no common SNPs in region", fontsize=title_size)
+        ax.set_title("Pairwise $r^2$: no common SNPs in region",
+                     fontsize=title_size)
         ax.set_xticks([]); ax.set_yticks([])
         return
     r2f = np.nan_to_num(r2_mat, nan=0.0)
@@ -728,14 +492,16 @@ def _draw_r2_heatmap(ax, r2_mat, hm_pos, chrom, region, n_hm_haps,
     ax.tick_params(labelsize=8)
     if with_inset:
         i0, i1 = _densest_block(r2f, frac=0.14)
-        z0, z1 = float(hm_pos[i0]) / 1e6, float(hm_pos[i1 - 1]) / 1e6
+        z0 = float(hm_pos[i0]) / 1e6
+        z1 = float(hm_pos[i1 - 1]) / 1e6
         axins = ax.inset_axes([0.58, 0.03, 0.40, 0.40])
         axins.imshow(r2f[i0:i1, i0:i1].T, cmap="magma", vmin=0, vmax=1,
                      origin="lower", interpolation="none",
                      extent=[z0, z1, z0, z1], aspect="equal")
         axins.set_xticks([z0, z1]); axins.set_yticks([z0, z1])
         axins.tick_params(labelsize=7)
-        axins.set_title(f"zoom {z0:.3f}-{z1:.3f} Mb", fontsize=8, fontweight="bold")
+        axins.set_title(f"zoom {z0:.3f}-{z1:.3f} Mb", fontsize=8,
+                        fontweight="bold")
         ax.indicate_inset_zoom(axins, edgecolor="white", lw=1.0, alpha=0.9)
     if title is None:
         title = (f"Pairwise $r^2$ ({POPS[0]}, MAF $\\geq$ {LD_HEATMAP_MIN_MAF})\n"
@@ -747,15 +513,12 @@ def _draw_r2_heatmap(ax, r2_mat, hm_pos, chrom, region, n_hm_haps,
 
 def plot_composite(df_main, garud_df, joint, ld_r2, r2_mat, hm_pos, n_hm_haps,
                    chrom, x_lo_mb, chrom_len, n_haps_per_pop, scale_label,
-                   ld_region, n_garud_sub, n_joint_sub, n_ld_sub, subtitle_extra,
-                   out_base):
-    """The headline composite: wide left column of genome-scan panels (faded raw
-    + bold smoothed traces, with the LD probe region shaded across all panels),
-    narrow right column = joint SFS / LD decay curve / pairwise-r^2 heatmap+zoom."""
+                   ld_region, n_garud_sub, n_joint_sub, n_ld_sub,
+                   subtitle_extra, out_base):
     afr, eur = POPS
     x = df_main["center"].values / 1e6
     gx = garud_df["center"].values / 1e6 if not garud_df.empty else None
-    div_color = "0.15"  # F_ST / D_xy: single track in dark grey -- color always maps to pop
+    div_color = "0.15"
 
     sns.set_theme(style="darkgrid", context="paper", font_scale=1.0)
     fig = plt.figure(figsize=(17, 12))
@@ -765,7 +528,6 @@ def plot_composite(df_main, garud_df, joint, ld_r2, r2_mat, hm_pos, n_hm_haps,
     right_gs = outer[0, 1].subgridspec(3, 1, height_ratios=[2, 2, 3], hspace=0.20)
 
     scan_axes = []
-
     def left(i):
         ax = fig.add_subplot(left_gs[i, 0])
         scan_axes.append(ax)
@@ -809,7 +571,8 @@ def plot_composite(df_main, garud_df, joint, ld_r2, r2_mat, hm_pos, n_hm_haps,
             ax.set_xlabel(f"chr{chrom} position (Mb)", fontsize=10)
     scan_axes[0].text((ld_region[0] + ld_region[1]) / 2e6,
                       scan_axes[0].get_ylim()[1], "LD panel", ha="center",
-                      va="bottom", fontsize=10, fontweight="bold", color="#c0392b",
+                      va="bottom", fontsize=10, fontweight="bold",
+                      color="#c0392b",
                       bbox=dict(boxstyle="round,pad=0.18", fc="white",
                                 ec="#c0392b", lw=0.8, alpha=0.9))
 
@@ -824,10 +587,11 @@ def plot_composite(df_main, garud_df, joint, ld_r2, r2_mat, hm_pos, n_hm_haps,
     cb = plt.colorbar(im, ax=ax_j, fraction=0.046, pad=0.04, shrink=0.85)
     cb.ax.tick_params(labelsize=7)
 
-    _draw_ld_decay(fig.add_subplot(right_gs[1, 0]), ld_r2, n_ld_sub, title_size=11,
-                   title=f"LD decay, MAF>{LD_DECAY_MIN_MAF}")
+    _draw_ld_decay(fig.add_subplot(right_gs[1, 0]), ld_r2, n_ld_sub,
+                   title_size=11, title=r"LD decay ($\sigma_d^2$)")
     _draw_r2_heatmap(fig.add_subplot(right_gs[2, 0]), r2_mat, hm_pos, chrom,
-                     ld_region, n_hm_haps, with_inset=True, title_size=11, title="")
+                     ld_region, n_hm_haps, with_inset=True, title_size=11,
+                     title="")
 
     fig.suptitle(f"pg_gpu chromosome scan -- simulated OOA_2T12 (Tennessen 2012), "
                  f"chr{chrom}: {n_haps_per_pop:,} haplotypes/population, "
@@ -837,8 +601,6 @@ def plot_composite(df_main, garud_df, joint, ld_r2, r2_mat, hm_pos, n_hm_haps,
 
 
 def plot_multiscale(windows_by_scale, chrom, x_lo_mb, chrom_len, out_base):
-    """Same statistic at three window scales, per population -- shows the
-    resolution/variance tradeoff."""
     afr, eur = POPS
     rows = [(f"pi_{afr}", rf"$\pi$/bp ({afr})", None),
             (f"pi_{eur}", rf"$\pi$/bp ({eur})", None),
@@ -846,8 +608,8 @@ def plot_multiscale(windows_by_scale, chrom, x_lo_mb, chrom_len, out_base):
             (f"tajimas_d_{eur}", f"Tajima's D ({eur})", 0.0)]
     sns.set_theme(style="darkgrid", context="paper", font_scale=0.9)
     fig = plt.figure(figsize=(14, 2.2 * len(rows)))
-    gs = GridSpec(len(rows), 1, figure=fig, hspace=0.28, left=0.07, right=0.97,
-                  top=0.93, bottom=0.06)
+    gs = GridSpec(len(rows), 1, figure=fig, hspace=0.28, left=0.07,
+                  right=0.97, top=0.93, bottom=0.06)
     scale_style = {"10kb": ("#bdbdbd", 0.5, 0.7, 1),
                    "100kb": ("#fb8072", 1.0, 0.95, 2),
                    "1mb": ("#1f78b4", 1.8, 1.0, 3)}
@@ -866,7 +628,8 @@ def plot_multiscale(windows_by_scale, chrom, x_lo_mb, chrom_len, out_base):
         ax.set_xlim(x_lo_mb, chrom_len / 1e6)
         ax.tick_params(labelsize=7)
         if r == 0:
-            ax.legend(loc="upper right", fontsize=8, ncol=3, title="window size")
+            ax.legend(loc="upper right", fontsize=8, ncol=3,
+                      title="window size")
         if r < len(rows) - 1:
             ax.set_xticklabels([])
         else:
@@ -876,15 +639,13 @@ def plot_multiscale(windows_by_scale, chrom, x_lo_mb, chrom_len, out_base):
     _save(fig, out_base)
 
 
-def plot_ld(r2_by_pop, r2_mat, hm_pos, n_hm_haps, chrom, region,
-            n_ld_sub, out_base):
-    """Standalone LD figure: mean-r^2 decay (per pop) + pairwise-r^2 heatmap of
-    the probe region with a zoomed-in inset on the densest LD block."""
+def plot_ld(ld_r2, r2_mat, hm_pos, n_hm_haps, chrom, region, n_ld_sub,
+            out_base):
     sns.set_theme(style="white", context="paper", font_scale=0.95)
     fig = plt.figure(figsize=(15, 6))
     gs = GridSpec(1, 2, figure=fig, width_ratios=[1, 1.25], wspace=0.28,
                   left=0.07, right=0.965, top=0.86, bottom=0.12)
-    _draw_ld_decay(fig.add_subplot(gs[0, 0]), r2_by_pop, n_ld_sub, title_size=11)
+    _draw_ld_decay(fig.add_subplot(gs[0, 0]), ld_r2, n_ld_sub, title_size=11)
     _draw_r2_heatmap(fig.add_subplot(gs[0, 1]), r2_mat, hm_pos, chrom, region,
                      n_hm_haps, with_inset=True, title_size=11)
     fig.suptitle(f"Linkage disequilibrium -- simulated OOA_2T12, chr{chrom}",
@@ -908,129 +669,131 @@ def parse_args():
                    help=f"directory holding chr*.vcz + chr*.pops.tsv "
                         f"(default {DEFAULT_DATA_DIR})")
     p.add_argument("--zarr", default=None,
-                   help="explicit path to a single VCZ store "
-                        "(overrides --data-dir / --chromosome)")
+                   help="explicit path to a single VCZ store (overrides "
+                        "--data-dir / --chromosome)")
     p.add_argument("--pop-file", default=None,
-                   help="sample_id<TAB>population TSV "
-                        "(default: <store>.pops.tsv next to the store)")
+                   help="sample_id<TAB>population TSV (default: "
+                        "<store>.pops.tsv next to the store)")
     p.add_argument("--chromosome", default=None,
-                   help="contig name to scan (default: the single chr*.vcz in "
-                        "--data-dir, or the single contig in --zarr)")
+                   help="contig name to scan (default: the single chr*.vcz "
+                        "in --data-dir)")
     p.add_argument("--chunk-bp", type=int, default=5_000_000,
-                   help="genomic chunk size streamed to the GPU at a time, bp "
+                   help="genomic chunk size streamed to the GPU at a time "
                         "(default 5,000,000)")
     p.add_argument("--prefetch", type=int, default=1,
-                   help="zarr-read prefetch depth (default 1: read next chunk "
-                        "on a worker thread while GPU computes current; "
-                        "0 disables and reads serially)")
+                   help="zarr-read prefetch depth (default 1)")
     p.add_argument("--ld-region", default=None,
-                   help="region 'start-end' in bp for the pairwise-r^2 heatmap "
-                        f"(default: a {LD_HEATMAP_REGION_BP//1000} kb window near "
-                        "the chromosome midpoint)")
-    p.add_argument("--tables-dir", default=str(TABLES_DIR),
-                   help=f"output directory for tables (default {TABLES_DIR})")
-    p.add_argument("--figures-dir", default=str(FIGURES_DIR),
-                   help=f"output directory for figures (default {FIGURES_DIR})")
+                   help="region 'start-end' bp for the r^2 heatmap "
+                        f"(default: ~{LD_HEATMAP_REGION_BP//1000} kb near "
+                        "chromosome midpoint)")
+    p.add_argument("--tables-dir", default=str(TABLES_DIR))
+    p.add_argument("--figures-dir", default=str(FIGURES_DIR))
     return p.parse_args()
-
-
-def pick_zarr(data_dir, requested):
-    paths = sorted(p for p in Path(data_dir).glob("chr*.vcz") if p.is_dir())
-    if not paths:
-        raise SystemExit(f"no chr*.vcz/ in {data_dir} -- run "
-                         f"ts_to_vcz.py first")
-    if requested:
-        path = Path(data_dir) / f"chr{requested}.vcz"
-        if not path.exists():
-            raise SystemExit(f"{path} not found")
-        return path
-    if len(paths) > 1:
-        names = ", ".join(p.stem[3:] for p in paths)
-        raise SystemExit(f"multiple chromosomes in {data_dir} ({names}); "
-                         "pass --chromosome")
-    return paths[0]
 
 
 def main():
     args = parse_args()
-
-    if args.zarr:
-        zarr_path = Path(args.zarr)
-    else:
-        zarr_path = pick_zarr(args.data_dir, args.chromosome)
+    zarr_path = (Path(args.zarr) if args.zarr
+                 else pick_zarr(args.data_dir, args.chromosome))
+    pop_file = Path(args.pop_file) if args.pop_file else (
+        zarr_path.parent / f"{zarr_path.stem}.pops.tsv")
+    if not pop_file.exists():
+        raise SystemExit(f"no pop file at {pop_file}; pass --pop-file")
 
     manifest_path = zarr_path.parent / "manifest.json"
     manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+    tables_dir = Path(args.tables_dir); tables_dir.mkdir(parents=True, exist_ok=True)
+    figures_dir = Path(args.figures_dir); figures_dir.mkdir(parents=True, exist_ok=True)
 
-    tables_dir = Path(args.tables_dir)
-    figures_dir = Path(args.figures_dir)
-    tables_dir.mkdir(parents=True, exist_ok=True)
-    figures_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"Opening {zarr_path} ...")
-    source = ZarrSource(zarr_path, pop_file=args.pop_file,
-                        contig_id=args.chromosome)
+    print(f"Opening {zarr_path} as streaming (chunk_bp={args.chunk_bp:,})")
+    stream = HaplotypeMatrix.from_zarr(
+        str(zarr_path),
+        streaming="always",
+        chunk_bp=args.chunk_bp,
+        prefetch=args.prefetch,
+        pop_file=str(pop_file),
+    )
     for p in POPS:
-        if p not in source.pop_cols:
-            raise SystemExit(f"population {p} not in {source.pop_file} "
-                             f"(have: {sorted(source.pop_cols.keys())})")
-    n_haps_per_pop = int(len(source.pop_cols[POPS[0]]))
-    chrom_len = source.chrom_length
-    x_lo_mb = float(np.floor(source.mappable_lo / 1e6))
-    print(f"  contig {source.chrom}: {source.num_variants:,} variants, "
+        if p not in stream.sample_sets:
+            raise SystemExit(f"population {p} not in {pop_file} "
+                             f"(have: {sorted(stream.sample_sets.keys())})")
+    n_haps_per_pop = len(stream.sample_sets[POPS[0]])
+    chrom_len = stream.chrom_end
+    x_lo_mb = float(np.floor(stream.chrom_start / 1e6))
+    print(f"  contig {stream.chrom}: {stream.num_variants:,} variants, "
           f"{n_haps_per_pop:,} haplotypes/pop, "
-          f"mappable {source.mappable_lo/1e6:.1f}-{source.mappable_hi/1e6:.1f} Mb")
+          f"mappable {stream.chrom_start/1e6:.1f}-{chrom_len/1e6:.1f} Mb")
 
-    t0 = time.perf_counter()
-    windows_by_scale, garud_df, sfs_by_pop, joint = windowed_scan(
-        source, args.chunk_bp, prefetch=args.prefetch)
-    print(f"windowed scan: {time.perf_counter() - t0:,.1f}s")
-
+    # Single chromosome pass: per-window diversity + divergence at every
+    # scale, marginal + joint SFS, and Garud's H per pop. All these
+    # stats reduce by chunk, so one walk through iter_gpu_chunks() does
+    # them all.
+    print("Single-pass scan: windowed + SFS + Garud ...")
+    windows_by_scale, garud_df, sfs_by_pop, joint = run_one_pass_scan(
+        stream, POPS)
     for label, _ in WINDOW_SCALES:
-        windows_by_scale[label].to_csv(tables_dir / f"windowed_stats_{label}.csv",
-                                       index=False)
+        windows_by_scale[label].to_csv(
+            tables_dir / f"windowed_stats_{label}.csv", index=False)
     garud_df.to_csv(tables_dir / "garud_h_10kb.csv", index=False)
     for p in POPS:
         pd.DataFrame({"derived_allele_count": np.arange(len(sfs_by_pop[p])),
                       "sites": sfs_by_pop[p]}).to_csv(
             tables_dir / f"sfs_{p}.csv", index=False)
-    # Cache the joint SFS for cheap replots (it would otherwise be the slow
-    # part to recompute -- needs another full chromosome pass).
     np.save(tables_dir / "joint_sfs.npy", joint)
 
-    print("LD decay ...")
+    # LD decay sampled by tiling the chromosome with probe regions,
+    # each materialized at the per-pop subsample (the streaming
+    # tail-buffer LD path is not subsample-aware at the data level,
+    # so a probe-and-materialize pattern keeps GPU memory bounded).
+    print(f"LD decay ({LD_SUBSAMPLE}-hap subsample/pop, probe regions) ...")
     t0 = time.perf_counter()
-    ld_decay_df, ld_r2 = ld_decay(source)
+    ld_decay_df = run_ld_decay(stream, POPS, LD_BP_BINS,
+                                subsample=LD_SUBSAMPLE,
+                                max_snps_per_probe=LD_DECAY_MAX_SNPS)
+    print(f"  {len(ld_decay_df)} bin x pop entries "
+          f"in {time.perf_counter()-t0:.1f}s")
     ld_decay_df.to_csv(tables_dir / "ld_decay.csv", index=False)
+    ld_r2 = {p: (ld_decay_df.loc[ld_decay_df["pop"] == p, "bin_mid_bp"].to_numpy(),
+                 ld_decay_df.loc[ld_decay_df["pop"] == p, "sigma_d2"].to_numpy())
+             for p in POPS}
+
+    # Pairwise r^2 heatmap of a 1 Mb sub-region (materialized).
+    print("LD r^2 heatmap ...")
+    t0 = time.perf_counter()
     if args.ld_region:
         a, b = args.ld_region.split("-")
         region = (int(a), int(b))
     else:
-        mid = (source.mappable_lo + source.mappable_hi) // 2
+        # Center on the variant-bearing range, not the chunk grid, so
+        # a long variant-free arm doesn't put the heatmap in empty space.
+        pos_arr = np.asarray(stream._source.site_pos)
+        v_lo, v_hi = int(pos_arr.min()), int(pos_arr.max()) + 1
+        mid = (v_lo + v_hi) // 2
         half = LD_HEATMAP_REGION_BP // 2
-        region = (max(source.mappable_lo, mid - half),
-                  min(source.mappable_hi, mid + half))
-    print("LD r^2 heatmap ...")
-    r2_mat, hm_pos, n_hm_haps = ld_heatmap(source, region)
+        region = (max(v_lo, mid - half), min(v_hi, mid + half))
+    r2_mat, hm_pos, n_hm_haps = run_ld_heatmap(
+        stream, POPS, region, LD_HEATMAP_SUBSAMPLE,
+        LD_HEATMAP_MIN_MAF, LD_HEATMAP_MAX_SNPS,
+    )
     np.save(tables_dir / "r2_heatmap.npy", r2_mat)
     np.save(tables_dir / "r2_heatmap_pos.npy", hm_pos)
-    print(f"LD analyses: {time.perf_counter() - t0:,.1f}s")
+    print(f"  {r2_mat.shape[0]} SNPs x {n_hm_haps:,} haps "
+          f"in {time.perf_counter()-t0:.1f}s")
 
+    # Headline summary.
     main_df = windows_by_scale[MAIN_SCALE]
     w = (main_df["end"] - main_df["start"]).astype(float).values
-
     def wmean(col):
         v = main_df[col].astype(float).values
         msk = np.isfinite(v)
         return float(np.average(v[msk], weights=w[msk])) if msk.any() else float("nan")
-
     summary = {
         "model": manifest.get("model", "OutOfAfrica_2T12"),
         "genetic_map": manifest.get("genetic_map"),
-        "chromosome": source.chrom,
+        "chromosome": stream.chrom,
         "chromosome_length": chrom_len,
         "haplotypes_per_pop": n_haps_per_pop,
-        "n_sites": source.num_variants,
+        "n_sites": int(stream.num_variants),
         "garud_subsample": min(GARUD_SUBSAMPLE, n_haps_per_pop),
         "joint_sfs_subsample": min(JOINT_SFS_SUBSAMPLE, n_haps_per_pop),
         "ld_subsample": min(LD_SUBSAMPLE, n_haps_per_pop),
@@ -1042,8 +805,10 @@ def main():
             **{f"mean_pi_{p}": wmean(f"pi_{p}") for p in POPS},
             **{f"mean_theta_w_{p}": wmean(f"theta_w_{p}") for p in POPS},
             **{f"mean_tajimas_d_{p}": wmean(f"tajimas_d_{p}") for p in POPS},
-            **{f"mean_normalized_fay_wu_h_{p}": wmean(f"normalized_fay_wu_h_{p}") for p in POPS},
-            "mean_fst": wmean("fst"), "mean_dxy": wmean("dxy"), "mean_da": wmean("da"),
+            **{f"mean_normalized_fay_wu_h_{p}":
+                   wmean(f"normalized_fay_wu_h_{p}") for p in POPS},
+            "mean_fst": wmean("fst"), "mean_dxy": wmean("dxy"),
+            "mean_da": wmean("da"),
             **{f"total_segregating_sites_{p}":
                    float(np.nansum(main_df[f"segregating_sites_{p}"])) for p in POPS},
         },
@@ -1053,17 +818,17 @@ def main():
     for k, v in summary["genomewide_100kb"].items():
         print(f"  {k}: {v:.6g}")
 
+    n_ld_sub = min(LD_SUBSAMPLE, n_haps_per_pop)
     plot_composite(main_df, garud_df, joint, ld_r2, r2_mat, hm_pos, n_hm_haps,
-                   source.chrom, x_lo_mb, chrom_len, n_haps_per_pop, MAIN_SCALE,
+                   stream.chrom, x_lo_mb, chrom_len, n_haps_per_pop, MAIN_SCALE,
                    region, min(GARUD_SUBSAMPLE, n_haps_per_pop),
-                   min(JOINT_SFS_SUBSAMPLE, n_haps_per_pop),
-                   min(LD_SUBSAMPLE, n_haps_per_pop),
-                   f"{source.num_variants:,} variants",
+                   min(JOINT_SFS_SUBSAMPLE, n_haps_per_pop), n_ld_sub,
+                   f"{stream.num_variants:,} variants",
                    str(figures_dir / "genome_scan_ooa"))
-    plot_multiscale(windows_by_scale, source.chrom, x_lo_mb, chrom_len,
+    plot_multiscale(windows_by_scale, stream.chrom, x_lo_mb, chrom_len,
                     str(figures_dir / "multiscale_ooa"))
-    plot_ld(ld_r2, r2_mat, hm_pos, n_hm_haps, source.chrom, region,
-            min(LD_SUBSAMPLE, n_haps_per_pop), str(figures_dir / "ld_ooa"))
+    plot_ld(ld_r2, r2_mat, hm_pos, n_hm_haps, stream.chrom, region,
+            n_ld_sub, str(figures_dir / "ld_ooa"))
 
 
 if __name__ == "__main__":
