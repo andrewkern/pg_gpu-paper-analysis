@@ -11,6 +11,7 @@ cufile.log
 .vscode/
 .idea/
 .DS_Store
+CLAUDE.md
 
 # TeX build artifacts (if a build ever lands inside the repo)
 *.aux
