@@ -33,7 +33,10 @@ What it computes
 * Pairwise r^2 heatmap of one ~1 Mb sub-region (common SNPs in one
   pop), with a zoomed-in inset on the densest LD block.
 
-Run inside the pg_gpu pixi environment with a free GPU, from the repo root:
+Run inside the pg_gpu pixi environment with a free GPU, from the repo
+root. The script takes no arguments: paths and the streaming knobs
+(CHUNK_BP, PREFETCH) live as module-level constants so the invocation
+is one line:
 
     cd /home/adkern/pg_gpu && pixi shell
     cd /home/adkern/pg_gpu-paper-analysis
@@ -53,7 +56,6 @@ Outputs (under 06_simulated_genome_scan/)
     figures/ld_ooa.{pdf,png}                     standalone LD decay + r^2 heatmap
 """
 
-import argparse
 import json
 import time
 from pathlib import Path
@@ -119,34 +121,31 @@ LD_HEATMAP_MIN_MAF = 0.05         # MAF cutoff for SNPs in the heatmap
 LD_HEATMAP_SUBSAMPLE = 5000       # haplotypes drawn (one pop)
 LD_HEATMAP_MAX_SNPS = 2000        # cap SNPs after MAF filter
 
+# Streaming knobs. Smaller chunks bound GPU memory; chunk_bp = 500 kb
+# at 100k diploids gives ~12 GB per chunk on chr15.
+CHUNK_BP = 500_000
+PREFETCH = 0
 
-# ── tiny helpers ────────────────────────────────────────────────────────────
 
 def free_gpu():
     cp.get_default_memory_pool().free_all_blocks()
     cp.get_default_pinned_memory_pool().free_all_blocks()
 
 
-def _as_list_int(idx):
-    """Convert any iterable of ints (numpy array, list, range) to a
-    plain ``list[int]`` -- the eager HaplotypeMatrix's sample_sets
-    setter rejects non-list values."""
-    return [int(i) for i in idx]
-
-
-def pick_zarr(data_dir, requested):
+def pick_zarr(data_dir, chrom=None):
+    """The single ``chr*.vcz`` store under ``data_dir`` (or
+    ``chr<chrom>.vcz`` when ``chrom`` is given, kept for replot.py)."""
     paths = sorted(p for p in Path(data_dir).glob("chr*.vcz") if p.is_dir())
     if not paths:
         raise SystemExit(f"no chr*.vcz/ in {data_dir} -- run ts_to_vcz.py first")
-    if requested:
-        path = Path(data_dir) / f"chr{requested}.vcz"
+    if chrom:
+        path = Path(data_dir) / f"chr{chrom}.vcz"
         if not path.exists():
             raise SystemExit(f"{path} not found")
         return path
     if len(paths) > 1:
         names = ", ".join(p.stem[3:] for p in paths)
-        raise SystemExit(f"multiple chromosomes in {data_dir} ({names}); "
-                         "pass --chromosome")
+        raise SystemExit(f"multiple chromosomes in {data_dir} ({names})")
     return paths[0]
 
 
@@ -168,10 +167,10 @@ def run_one_pass_scan(stream, populations):
 
     Returns ``(windowed_by_scale, garud_df, marginal_sfs_by_pop, joint_sfs)``.
     """
-    # Subsamples for joint SFS and Garud's H. Convert to plain lists so
-    # the per-chunk sample_sets setter (which only accepts list values)
-    # accepts the streaming source's numpy-array pop indices too.
-    full_pop_lists = {p: _as_list_int(stream.sample_sets[p]) for p in populations}
+    # Plain-list pop indices for the per-chunk sample_sets setter, which
+    # only accepts list values (streaming source hands them as numpy arrays).
+    full_pop_lists = {p: [int(i) for i in stream.sample_sets[p]]
+                       for p in populations}
     sub_j = {p: full_pop_lists[p][:JOINT_SFS_SUBSAMPLE] for p in populations}
     sub_g = {p: full_pop_lists[p][:GARUD_SUBSAMPLE] for p in populations}
 
@@ -213,23 +212,17 @@ def run_one_pass_scan(stream, populations):
             if not base.empty:
                 windowed[label].append(base.reset_index(drop=True))
 
-        garud_per_pop = []
-        for p in populations:
-            df_g = windowed_analysis(chunk_hm, window_size=GARUD_SCALE_BP,
-                                      step_size=GARUD_SCALE_BP,
-                                      statistics=GARUD_STATS,
-                                      populations=[f"{p}_g"])
-            df_g = df_g.rename(columns={**{s: f"{s}_{p}" for s in GARUD_STATS},
-                                          "n_variants": f"n_variants_{p}"})
-            garud_per_pop.append(df_g)
-        gdf = garud_per_pop[0]
-        for extra in garud_per_pop[1:]:
-            gdf = gdf.merge(
-                extra.drop(columns=["chrom"], errors="ignore"),
-                on=["start", "end", "center"], how="inner",
-                suffixes=("", "_dup"),
-            )
-            gdf = gdf.loc[:, ~gdf.columns.str.endswith("_dup")]
+        g_per_pop = [windowed_analysis(chunk_hm,
+                                         window_size=GARUD_SCALE_BP,
+                                         step_size=GARUD_SCALE_BP,
+                                         statistics=GARUD_STATS,
+                                         populations=[f"{p}_g"])
+                     for p in populations]
+        gdf = g_per_pop[0][["chrom", "start", "end", "center"]].copy()
+        for i, p in enumerate(populations):
+            gdf[f"n_variants_{p}"] = g_per_pop[i]["n_variants"].values
+            for s in GARUD_STATS:
+                gdf[f"{s}_{p}"] = g_per_pop[i][s].values
         any_var = sum(gdf[f"n_variants_{p}"].values > 0 for p in populations)
         gdf = gdf[any_var > 0]
         if not gdf.empty:
@@ -274,8 +267,8 @@ def run_ld_decay(stream, populations, bp_bins, *,
     materialize keeps the GPU memory bounded by the subsample size.
     """
     afr, eur = populations
-    afr_idx = _as_list_int(stream.sample_sets[afr])[:subsample]
-    eur_idx = _as_list_int(stream.sample_sets[eur])[:subsample]
+    afr_idx = [int(i) for i in stream.sample_sets[afr][:subsample]]
+    eur_idx = [int(i) for i in stream.sample_sets[eur][:subsample]]
     n_afr = len(afr_idx)
     sample_subset = afr_idx + eur_idx
 
@@ -660,91 +653,41 @@ def _save(fig, out_base):
     print(f"Figure saved to {out_base}.pdf / .png")
 
 
-# ── main ────────────────────────────────────────────────────────────────────
-
-def parse_args():
-    p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--data-dir", default=DEFAULT_DATA_DIR,
-                   help=f"directory holding chr*.vcz + chr*.pops.tsv "
-                        f"(default {DEFAULT_DATA_DIR})")
-    p.add_argument("--zarr", default=None,
-                   help="explicit path to a single VCZ store (overrides "
-                        "--data-dir / --chromosome)")
-    p.add_argument("--pop-file", default=None,
-                   help="sample_id<TAB>population TSV (default: "
-                        "<store>.pops.tsv next to the store)")
-    p.add_argument("--chromosome", default=None,
-                   help="contig name to scan (default: the single chr*.vcz "
-                        "in --data-dir)")
-    p.add_argument("--chunk-bp", type=int, default=5_000_000,
-                   help="genomic chunk size streamed to the GPU at a time "
-                        "(default 5,000,000)")
-    p.add_argument("--prefetch", type=int, default=1,
-                   help="zarr-read prefetch depth (default 1)")
-    p.add_argument("--ld-region", default=None,
-                   help="region 'start-end' bp for the r^2 heatmap "
-                        f"(default: ~{LD_HEATMAP_REGION_BP//1000} kb near "
-                        "chromosome midpoint)")
-    p.add_argument("--tables-dir", default=str(TABLES_DIR))
-    p.add_argument("--figures-dir", default=str(FIGURES_DIR))
-    return p.parse_args()
-
-
 def main():
-    args = parse_args()
-    zarr_path = (Path(args.zarr) if args.zarr
-                 else pick_zarr(args.data_dir, args.chromosome))
-    pop_file = Path(args.pop_file) if args.pop_file else (
-        zarr_path.parent / f"{zarr_path.stem}.pops.tsv")
+    zarr_path = pick_zarr(DEFAULT_DATA_DIR)
+    pop_file = zarr_path.parent / f"{zarr_path.stem}.pops.tsv"
     if not pop_file.exists():
-        raise SystemExit(f"no pop file at {pop_file}; pass --pop-file")
+        raise SystemExit(f"no pop file at {pop_file}")
+    TABLES_DIR.mkdir(parents=True, exist_ok=True)
+    FIGURES_DIR.mkdir(parents=True, exist_ok=True)
 
-    manifest_path = zarr_path.parent / "manifest.json"
-    manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
-    tables_dir = Path(args.tables_dir); tables_dir.mkdir(parents=True, exist_ok=True)
-    figures_dir = Path(args.figures_dir); figures_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"Opening {zarr_path} as streaming (chunk_bp={args.chunk_bp:,})")
+    print(f"Opening {zarr_path} (chunk_bp={CHUNK_BP:,}) ...")
     stream = HaplotypeMatrix.from_zarr(
-        str(zarr_path),
-        streaming="always",
-        chunk_bp=args.chunk_bp,
-        prefetch=args.prefetch,
-        pop_file=str(pop_file),
+        str(zarr_path), streaming="always",
+        chunk_bp=CHUNK_BP, prefetch=PREFETCH, pop_file=str(pop_file),
     )
-    for p in POPS:
-        if p not in stream.sample_sets:
-            raise SystemExit(f"population {p} not in {pop_file} "
-                             f"(have: {sorted(stream.sample_sets.keys())})")
     n_haps_per_pop = len(stream.sample_sets[POPS[0]])
     chrom_len = stream.chrom_end
     x_lo_mb = float(np.floor(stream.chrom_start / 1e6))
     print(f"  contig {stream.chrom}: {stream.num_variants:,} variants, "
-          f"{n_haps_per_pop:,} haplotypes/pop, "
-          f"mappable {stream.chrom_start/1e6:.1f}-{chrom_len/1e6:.1f} Mb")
+          f"{n_haps_per_pop:,} haplotypes/pop")
 
     # Single chromosome pass: per-window diversity + divergence at every
-    # scale, marginal + joint SFS, and Garud's H per pop. All these
-    # stats reduce by chunk, so one walk through iter_gpu_chunks() does
-    # them all.
+    # scale, marginal + joint SFS, Garud's H per pop. All reduce by
+    # chunk, so one walk through iter_gpu_chunks() does them all.
     print("Single-pass scan: windowed + SFS + Garud ...")
     windows_by_scale, garud_df, sfs_by_pop, joint = run_one_pass_scan(
         stream, POPS)
     for label, _ in WINDOW_SCALES:
         windows_by_scale[label].to_csv(
-            tables_dir / f"windowed_stats_{label}.csv", index=False)
-    garud_df.to_csv(tables_dir / "garud_h_10kb.csv", index=False)
+            TABLES_DIR / f"windowed_stats_{label}.csv", index=False)
+    garud_df.to_csv(TABLES_DIR / "garud_h_10kb.csv", index=False)
     for p in POPS:
         pd.DataFrame({"derived_allele_count": np.arange(len(sfs_by_pop[p])),
                       "sites": sfs_by_pop[p]}).to_csv(
-            tables_dir / f"sfs_{p}.csv", index=False)
-    np.save(tables_dir / "joint_sfs.npy", joint)
+            TABLES_DIR / f"sfs_{p}.csv", index=False)
+    np.save(TABLES_DIR / "joint_sfs.npy", joint)
 
-    # LD decay sampled by tiling the chromosome with probe regions,
-    # each materialized at the per-pop subsample (the streaming
-    # tail-buffer LD path is not subsample-aware at the data level,
-    # so a probe-and-materialize pattern keeps GPU memory bounded).
     print(f"LD decay ({LD_SUBSAMPLE}-hap subsample/pop, probe regions) ...")
     t0 = time.perf_counter()
     ld_decay_df = run_ld_decay(stream, POPS, LD_BP_BINS,
@@ -752,55 +695,50 @@ def main():
                                 max_snps_per_probe=LD_DECAY_MAX_SNPS)
     print(f"  {len(ld_decay_df)} bin x pop entries "
           f"in {time.perf_counter()-t0:.1f}s")
-    ld_decay_df.to_csv(tables_dir / "ld_decay.csv", index=False)
+    ld_decay_df.to_csv(TABLES_DIR / "ld_decay.csv", index=False)
     ld_r2 = {p: (ld_decay_df.loc[ld_decay_df["pop"] == p, "bin_mid_bp"].to_numpy(),
                  ld_decay_df.loc[ld_decay_df["pop"] == p, "sigma_d2"].to_numpy())
              for p in POPS}
 
-    # Pairwise r^2 heatmap of a 1 Mb sub-region (materialized).
+    # Pairwise r^2 heatmap centered on the variant-bearing range (not
+    # the chunk grid -- a long variant-free arm would put the heatmap
+    # in empty space).
     print("LD r^2 heatmap ...")
     t0 = time.perf_counter()
-    if args.ld_region:
-        a, b = args.ld_region.split("-")
-        region = (int(a), int(b))
-    else:
-        # Center on the variant-bearing range, not the chunk grid, so
-        # a long variant-free arm doesn't put the heatmap in empty space.
-        pos_arr = np.asarray(stream._source.site_pos)
-        v_lo, v_hi = int(pos_arr.min()), int(pos_arr.max()) + 1
-        mid = (v_lo + v_hi) // 2
-        half = LD_HEATMAP_REGION_BP // 2
-        region = (max(v_lo, mid - half), min(v_hi, mid + half))
+    pos_arr = np.asarray(stream._source.site_pos)
+    v_lo, v_hi = int(pos_arr.min()), int(pos_arr.max()) + 1
+    mid = (v_lo + v_hi) // 2
+    half = LD_HEATMAP_REGION_BP // 2
+    region = (max(v_lo, mid - half), min(v_hi, mid + half))
     r2_mat, hm_pos, n_hm_haps = run_ld_heatmap(
         stream, POPS, region, LD_HEATMAP_SUBSAMPLE,
         LD_HEATMAP_MIN_MAF, LD_HEATMAP_MAX_SNPS,
     )
-    np.save(tables_dir / "r2_heatmap.npy", r2_mat)
-    np.save(tables_dir / "r2_heatmap_pos.npy", hm_pos)
+    np.save(TABLES_DIR / "r2_heatmap.npy", r2_mat)
+    np.save(TABLES_DIR / "r2_heatmap_pos.npy", hm_pos)
     print(f"  {r2_mat.shape[0]} SNPs x {n_hm_haps:,} haps "
           f"in {time.perf_counter()-t0:.1f}s")
 
-    # Headline summary.
     main_df = windows_by_scale[MAIN_SCALE]
     w = (main_df["end"] - main_df["start"]).astype(float).values
     def wmean(col):
         v = main_df[col].astype(float).values
         msk = np.isfinite(v)
         return float(np.average(v[msk], weights=w[msk])) if msk.any() else float("nan")
+    n_ld_sub = min(LD_SUBSAMPLE, n_haps_per_pop)
     summary = {
-        "model": manifest.get("model", "OutOfAfrica_2T12"),
-        "genetic_map": manifest.get("genetic_map"),
         "chromosome": stream.chrom,
         "chromosome_length": chrom_len,
         "haplotypes_per_pop": n_haps_per_pop,
         "n_sites": int(stream.num_variants),
         "garud_subsample": min(GARUD_SUBSAMPLE, n_haps_per_pop),
         "joint_sfs_subsample": min(JOINT_SFS_SUBSAMPLE, n_haps_per_pop),
-        "ld_subsample": min(LD_SUBSAMPLE, n_haps_per_pop),
+        "ld_subsample": n_ld_sub,
         "ld_heatmap_min_maf": LD_HEATMAP_MIN_MAF,
         "ld_heatmap_region": list(region),
         "ld_heatmap_n_snps": int(r2_mat.shape[0]),
-        "windows": {label: int(len(windows_by_scale[label])) for label, _ in WINDOW_SCALES},
+        "windows": {label: int(len(windows_by_scale[label]))
+                    for label, _ in WINDOW_SCALES},
         "genomewide_100kb": {
             **{f"mean_pi_{p}": wmean(f"pi_{p}") for p in POPS},
             **{f"mean_theta_w_{p}": wmean(f"theta_w_{p}") for p in POPS},
@@ -810,25 +748,25 @@ def main():
             "mean_fst": wmean("fst"), "mean_dxy": wmean("dxy"),
             "mean_da": wmean("da"),
             **{f"total_segregating_sites_{p}":
-                   float(np.nansum(main_df[f"segregating_sites_{p}"])) for p in POPS},
+                   float(np.nansum(main_df[f"segregating_sites_{p}"]))
+                   for p in POPS},
         },
     }
-    (tables_dir / "chromosome_summary.json").write_text(json.dumps(summary, indent=2))
+    (TABLES_DIR / "chromosome_summary.json").write_text(json.dumps(summary, indent=2))
     print("\nSummary (100 kb windows):")
     for k, v in summary["genomewide_100kb"].items():
         print(f"  {k}: {v:.6g}")
 
-    n_ld_sub = min(LD_SUBSAMPLE, n_haps_per_pop)
     plot_composite(main_df, garud_df, joint, ld_r2, r2_mat, hm_pos, n_hm_haps,
                    stream.chrom, x_lo_mb, chrom_len, n_haps_per_pop, MAIN_SCALE,
                    region, min(GARUD_SUBSAMPLE, n_haps_per_pop),
                    min(JOINT_SFS_SUBSAMPLE, n_haps_per_pop), n_ld_sub,
                    f"{stream.num_variants:,} variants",
-                   str(figures_dir / "genome_scan_ooa"))
+                   str(FIGURES_DIR / "genome_scan_ooa"))
     plot_multiscale(windows_by_scale, stream.chrom, x_lo_mb, chrom_len,
-                    str(figures_dir / "multiscale_ooa"))
+                    str(FIGURES_DIR / "multiscale_ooa"))
     plot_ld(ld_r2, r2_mat, hm_pos, n_hm_haps, stream.chrom, region,
-            n_ld_sub, str(figures_dir / "ld_ooa"))
+            n_ld_sub, str(FIGURES_DIR / "ld_ooa"))
 
 
 if __name__ == "__main__":
