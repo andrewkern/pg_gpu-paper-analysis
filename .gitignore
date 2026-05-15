@@ -5,3 +5,19 @@ __pycache__/
 .venv-*/
 cufile.log
 06_simulated_genome_scan/data/
+
+# Local agent / IDE state
+.claude/
+.vscode/
+.idea/
+.DS_Store
+
+# TeX build artifacts (if a build ever lands inside the repo)
+*.aux
+*.bbl
+*.bcf
+*.blg
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.toc
