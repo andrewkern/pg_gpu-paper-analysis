@@ -20,17 +20,17 @@
     "1mb": 165
   },
   "genomewide_100kb": {
-    "mean_pi_AFR": 0.0007463995408274448,
-    "mean_pi_EUR": 0.0005445217740201245,
+    "mean_pi_AFR": 0.0007463995408274449,
+    "mean_pi_EUR": 0.0005445217740201249,
     "mean_theta_w_AFR": 0.005867839682177826,
     "mean_theta_w_EUR": 0.005856455993472346,
-    "mean_tajimas_d_AFR": -2.2576910894027047,
-    "mean_tajimas_d_EUR": -2.346162845369407,
-    "mean_normalized_fay_wu_h_AFR": 0.02777597463595823,
-    "mean_normalized_fay_wu_h_EUR": -0.08248740857174956,
-    "mean_fst": 0.1618347300082093,
-    "mean_dxy": 0.0007749873188468315,
-    "mean_da": 0.0001295266614230466,
+    "mean_tajimas_d_AFR": -2.257691089402704,
+    "mean_tajimas_d_EUR": -2.3461628453694074,
+    "mean_normalized_fay_wu_h_AFR": 0.02777597463595835,
+    "mean_normalized_fay_wu_h_EUR": -0.08248740857174942,
+    "mean_fst": 0.16183473000820955,
+    "mean_dxy": 0.0007749873188468309,
+    "mean_da": 0.0001295266614230461,
     "total_segregating_sites_AFR": 5830887.0,
     "total_segregating_sites_EUR": 5819575.0
   }
