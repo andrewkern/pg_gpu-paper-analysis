@@ -647,7 +647,7 @@ def plot_composite(df_main, garud_df, joint, ld_r2, r2_mat, hm_pos, n_hm_haps,
                      ld_region, n_hm_haps, with_inset=True, title_size=11,
                      title="")
 
-    fig.suptitle(f"pg_gpu chromosome scan -- simulated OOA_2T12 (Tennessen 2012), "
+    fig.suptitle(f"two population out-of-Africa (OOA_2T12, Tennessen; 2012), "
                  f"chr{chrom}: {n_haps_per_pop:,} haplotypes/population, "
                  f"{subtitle_extra}, {scale_label} windows",
                  fontsize=13, fontweight="bold", y=0.985)
@@ -729,7 +729,13 @@ def main():
     )
     n_haps_per_pop = len(stream.sample_sets[POPS[0]])
     chrom_len = stream.chrom_end
-    x_lo_mb = float(np.floor(stream.chrom_start / 1e6))
+    # x-axis clips to the variant-bearing range. ``stream.chrom_start``
+    # is the chunk-grid origin (0 for chr15), which would leave the
+    # entire non-recombining acrocentric arm as empty whitespace on
+    # the left of the scan figure. Use the first variant position
+    # instead -- this matches replot.py's clip.
+    pos_arr = np.asarray(stream._source.site_pos)
+    x_lo_mb = float(np.floor(int(pos_arr.min()) / 1e6))
     print(f"  contig {stream.chrom}: {stream.num_variants:,} variants, "
           f"{n_haps_per_pop:,} haplotypes/pop")
 
