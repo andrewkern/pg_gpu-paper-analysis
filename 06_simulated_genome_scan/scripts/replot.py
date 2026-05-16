@@ -88,7 +88,7 @@ def main():
                  decay_df.loc[decay_df["pop"] == p, "mean_r2"].to_numpy())
              for p in gs.POPS}
 
-    x_lo_mb = float(np.floor(main_df["start"].min() / 1e6))
+    x_lo_mb = gs.SCAN_X_LO_MB
 
     joint_npy = tdir / "joint_sfs.npy"
     r2_npy = tdir / "r2_heatmap.npy"

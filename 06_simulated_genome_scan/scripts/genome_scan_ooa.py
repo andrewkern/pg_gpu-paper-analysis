@@ -133,6 +133,14 @@ LD_HEATMAP_MAX_SNPS = 2000        # cap SNPs after MAF filter
 CHUNK_BP = 500_000
 PREFETCH = 0
 
+# Left edge of the genome-scan x-axis in Mb. Variants start at ~19.8 Mb
+# (the chr15 acrocentric arm and centromere are variant-free), but the
+# statistics in the first ~1.5 Mb after the centromere still sit in
+# its low-effective-recombination shadow -- pi recovers to its
+# asymptote only around 21 Mb. Clip there so the plotted region is
+# the recombining part of the chromosome.
+SCAN_X_LO_MB = 21.0
+
 
 def free_gpu():
     cp.get_default_memory_pool().free_all_blocks()
@@ -729,13 +737,7 @@ def main():
     )
     n_haps_per_pop = len(stream.sample_sets[POPS[0]])
     chrom_len = stream.chrom_end
-    # x-axis clips to the variant-bearing range. ``stream.chrom_start``
-    # is the chunk-grid origin (0 for chr15), which would leave the
-    # entire non-recombining acrocentric arm as empty whitespace on
-    # the left of the scan figure. Use the first variant position
-    # instead -- this matches replot.py's clip.
-    pos_arr = np.asarray(stream._source.site_pos)
-    x_lo_mb = float(np.floor(int(pos_arr.min()) / 1e6))
+    x_lo_mb = SCAN_X_LO_MB
     print(f"  contig {stream.chrom}: {stream.num_variants:,} variants, "
           f"{n_haps_per_pop:,} haplotypes/pop")
 
