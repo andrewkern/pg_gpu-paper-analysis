@@ -653,7 +653,7 @@ def plot_composite(df_main, garud_df, joint, ld_r2, r2_mat, hm_pos, n_hm_haps,
                    title_size=11, title=r"LD decay ($\sigma_d^2$)")
     _draw_r2_heatmap(fig.add_subplot(right_gs[2, 0]), r2_mat, hm_pos, chrom,
                      ld_region, n_hm_haps, with_inset=True, title_size=11,
-                     title="")
+                     title="LD heatmap")
 
     fig.suptitle(f"two population out-of-Africa (OOA_2T12, Tennessen; 2012), "
                  f"chr{chrom}: {n_haps_per_pop:,} haplotypes/population, "
