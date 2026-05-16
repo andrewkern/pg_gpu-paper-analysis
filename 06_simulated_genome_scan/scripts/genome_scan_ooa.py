@@ -105,15 +105,22 @@ LD_SUBSAMPLE = 5_000
 # Per-probe SNP cap for LD decay. Pair count grows quadratically with
 # the variant count, so a 5 Mb probe at biobank-scale variant density
 # (~120k SNPs/Mb) would give 600k SNPs and ~6 billion pairs per probe;
-# the cap downsamples (uniformly along position) to a tractable count
-# whose pair-bin sums are still a sound moments-LD estimate.
+# the cap downsamples (uniformly along position) to a tractable count.
 LD_DECAY_MAX_SNPS = 12_000
 
+# MAF cutoff applied per pop before LD-decay pairs are counted. With
+# no filter, rare-variant pairs dominate the bin sums and the per-pair
+# mean r^2 (small p(1-p) divisor) plus the moments-LD sigma_d^2 ratio
+# both come out anomalously low in the shortest bins. 0.15 matches
+# the smoke-figure convention and is the value most empirical LD
+# papers use.
+LD_DECAY_MIN_MAF = 0.15
+
 # LD pair-bin breakpoints in bp. The last entry is the maximum pair
-# distance the streaming compute walks; everything farther apart is
-# skipped.
+# distance the moments-LD pair-iterator walks; everything farther
+# apart is skipped.
 LD_BP_BINS = [0, 500, 1_000, 2_000, 5_000, 10_000, 20_000, 50_000,
-              100_000, 200_000]
+              100_000, 200_000, 500_000]
 
 # Pairwise-r^2 heatmap of one sub-region (eager).
 LD_HEATMAP_REGION_BP = 1_000_000  # width of the heatmap region
@@ -252,19 +259,22 @@ def run_one_pass_scan(stream, populations):
 
 def run_ld_decay(stream, populations, bp_bins, *,
                   subsample=5_000, n_probes=16, probe_bp=5_000_000,
-                  max_snps_per_probe=12_000):
-    """Moments-LD pair-bin statistics (DD, Dz, pi2) for both pops and
-    the between-pop case, sampled by tiling the chromosome with
-    ``n_probes`` materialized probe regions. Each probe is loaded
-    eagerly with only the per-pop ``subsample`` haplotypes -- so per
-    probe ~ (subsample, probe_bp * density) int8 instead of the full
-    biobank-scale matrix -- and the bin sums are accumulated as raw
-    moments-LD numerators across probes. The final ratio sigma_d^2 =
-    sum(DD) / sum(pi2) is computed once at the end.
+                  max_snps_per_probe=12_000, min_maf=0.15):
+    """LD decay sampled across ``n_probes`` materialized probe regions
+    tiling the chromosome. Each probe loads only the per-pop
+    ``subsample`` haplotypes via ``stream.materialize(...)`` and
+    reports two complementary decay summaries side by side:
 
-    This is what the streaming pair-bin function would do natively, if
-    the tail-buffer stitch were subsample-aware. Until then, probe-and-
-    materialize keeps the GPU memory bounded by the subsample size.
+    * ``mean_r2`` -- the per-pop mean of pairwise r^2 over common
+      SNPs (MAF >= ``min_maf`` in both pops). This is the biased
+      naive average that most empirical LD-decay plots show.
+    * ``DD`` / ``Dz`` / ``pi2`` / ``sigma_d2`` -- the unbiased
+      moments-LD ratio-of-sums (Ragsdale & Gravel 2019) per bin,
+      per pop, and for the between-pop pair.
+
+    Both summaries share the same MAF-filtered SNP set per probe;
+    a 12,000-SNP cap is applied uniformly along position so the
+    pair count stays tractable.
     """
     afr, eur = populations
     afr_idx = [int(i) for i in stream.sample_sets[afr][:subsample]]
@@ -273,31 +283,36 @@ def run_ld_decay(stream, populations, bp_bins, *,
     sample_subset = afr_idx + eur_idx
 
     bins = np.asarray(bp_bins, dtype=float)
+    bins_gpu = cp.asarray(bins)
     mids = np.sqrt(np.maximum(bins[:-1], 1.0) * bins[1:])
     mids[0] = bins[1] / 2.0
     n_bins = len(bins) - 1
+    max_d = float(bins[-1])
 
     cats = (afr, eur, f"{afr}_{eur}")
     cat_stats = {afr: ("DD_0_0", "Dz_0_0_0", "pi2_0_0_0_0"),
                   eur: ("DD_1_1", "Dz_1_1_1", "pi2_1_1_1_1"),
                   f"{afr}_{eur}": ("DD_0_1", "Dz_0_0_1", "pi2_0_0_1_1")}
     accum = {c: {"DD": np.zeros(n_bins), "Dz": np.zeros(n_bins),
-                  "pi2": np.zeros(n_bins)} for c in cats}
+                  "pi2": np.zeros(n_bins),
+                  "sum_r2": np.zeros(n_bins),
+                  "n_pairs": np.zeros(n_bins, dtype=np.int64)}
+             for c in cats}
 
-    # Use the variant-bearing range rather than the chunk grid; on a
-    # chromosome with a large variant-free arm (e.g. chr15's
-    # acrocentric region) probes pinned to the chunk grid would land
-    # in empty space and materialize 0 variants.
+    # Probe centers walk the variant-bearing range rather than the
+    # chunk grid; on a chromosome with a large variant-free arm
+    # (e.g. chr15's acrocentric region) probes pinned to the chunk
+    # grid would land in empty space and materialize 0 variants.
     pos_arr = np.asarray(stream._source.site_pos)
-    lo = int(pos_arr.min())
-    hi = int(pos_arr.max()) + 1
-    span = max(probe_bp, (hi - lo) // n_probes)
-    lefts = np.unique(np.linspace(lo, max(lo, hi - span), n_probes).astype(int))
+    chrom_lo = int(pos_arr.min())
+    chrom_hi = int(pos_arr.max()) + 1
+    span = max(probe_bp, (chrom_hi - chrom_lo) // n_probes)
+    lefts = np.unique(np.linspace(
+        chrom_lo, max(chrom_lo, chrom_hi - span), n_probes
+    ).astype(int))
+
     for pi_, left in enumerate(lefts):
-        right = min(int(left) + span, hi)
-        # Skip empty intervals defensively -- biobank stores can have
-        # masked / unmappable runs even within the variant-bearing
-        # range.
+        right = min(int(left) + span, chrom_hi)
         if not ((pos_arr >= left) & (pos_arr < right)).any():
             print(f"  probe {pi_+1}/{len(lefts)} "
                   f"[{int(left)/1e6:.1f}-{right/1e6:.1f} Mb] empty, skipped",
@@ -313,21 +328,44 @@ def run_ld_decay(stream, populations, bp_bins, *,
         # mock-up is harmless.
         eager.sample_sets = {afr: list(range(n_afr)),
                               eur: list(range(n_afr, n_afr + len(eur_idx)))}
-        # Cap variants per probe: pair count grows quadratically and
-        # at biobank-scale variant density a 5 Mb probe has hundreds
-        # of thousands of SNPs. Pick ~max_snps_per_probe along the
-        # variant axis (uniform indices) before the pair iteration.
-        if eager.num_variants > max_snps_per_probe:
-            pick = cp.linspace(0, eager.num_variants - 1,
-                                max_snps_per_probe).astype(cp.int64)
-            eager = HaplotypeMatrix(
-                cp.ascontiguousarray(eager.haplotypes[:, pick]),
-                eager.positions[pick],
-                chrom_start=int(left), chrom_end=right - 1,
-                sample_sets=eager.sample_sets,
-            )
-        result = eager.compute_ld_statistics_gpu_two_pops(
-            bp_bins, pop1=afr, pop2=eur, ac_filter=True, raw=True,
+
+        # MAF filter applied per pop: keep variants that are common
+        # in both AFR and EUR. Without this, low-MAF pairs dominate
+        # bin counts and depress both mean_r^2 and sigma_d^2 in the
+        # shortest distance bins.
+        haps = eager.haplotypes
+        af_afr = (haps[:n_afr] > 0).sum(axis=0).astype(cp.float64) / n_afr
+        af_eur = (haps[n_afr:] > 0).sum(axis=0).astype(cp.float64) / (
+            haps.shape[0] - n_afr)
+        keep = (cp.minimum(af_afr, 1.0 - af_afr) >= min_maf) & (
+                cp.minimum(af_eur, 1.0 - af_eur) >= min_maf)
+        # ``haps[:, keep]`` (2-D boolean indexing) makes cupy build a
+        # full (n_hap, n_var) int64 prefix-sum scratch -- 40+ GB at
+        # biobank-scale probes. ``cp.compress`` filters axis-1 in
+        # one pass without that scratch.
+        haps_filt = cp.ascontiguousarray(cp.compress(keep, haps, axis=1))
+        pos_filt = eager.positions[keep]
+        n_var = int(haps_filt.shape[1])
+        if n_var > max_snps_per_probe:
+            pick = cp.linspace(0, n_var - 1, max_snps_per_probe).astype(cp.int64)
+            haps_filt = cp.ascontiguousarray(haps_filt[:, pick])
+            pos_filt = pos_filt[pick]
+            n_var = int(haps_filt.shape[1])
+        if n_var < 3:
+            del eager, haps_filt
+            free_gpu()
+            continue
+
+        eager_filt = HaplotypeMatrix(
+            haps_filt, pos_filt,
+            chrom_start=int(left), chrom_end=right - 1,
+            sample_sets={afr: list(range(n_afr)),
+                          eur: list(range(n_afr, n_afr + len(eur_idx)))},
+        )
+
+        # 1) Moments-LD raw sums (DD, Dz, pi2) for AFR, EUR, AFR-EUR.
+        result = eager_filt.compute_ld_statistics_gpu_two_pops(
+            bp_bins, pop1=afr, pop2=eur, ac_filter=False, raw=True,
         )
         for i, key in enumerate(zip(bins[:-1], bins[1:])):
             stats = result[(float(key[0]), float(key[1]))]
@@ -336,39 +374,62 @@ def run_ld_decay(stream, populations, bp_bins, *,
                 accum[c]["DD"][i] += stats[k_dd]
                 accum[c]["Dz"][i] += stats[k_dz]
                 accum[c]["pi2"][i] += stats[k_pi2]
-        del eager
+
+        # 2) Per-pop mean r^2: pairwise_r2 on each pop's hap subset,
+        # then bin by SNP-pair distance. The between-pop case has no
+        # within-pop mean_r^2 (mean_r^2 is a single-population quantity);
+        # the corresponding rows in the output carry mean_r^2 = NaN.
+        for pop_label, (hap_lo, hap_hi) in [
+            (afr, (0, n_afr)),
+            (eur, (n_afr, int(haps_filt.shape[0]))),
+        ]:
+            hap_pop = HaplotypeMatrix(
+                cp.ascontiguousarray(haps_filt[hap_lo:hap_hi]),
+                pos_filt,
+                chrom_start=int(left), chrom_end=right - 1,
+            )
+            r2 = hap_pop.pairwise_r2()
+            r2 = r2 if isinstance(r2, cp.ndarray) else cp.asarray(r2)
+            iu, ju = cp.triu_indices(r2.shape[0], k=1)
+            d = pos_filt[ju] - pos_filt[iu]
+            v = r2[iu, ju].astype(cp.float64)
+            del r2
+            keep_v = cp.isfinite(v) & (d <= max_d)
+            d, v = d[keep_v], v[keep_v]
+            cb = cp.digitize(d, bins_gpu) - 1
+            # Histogram + weighted histogram for per-bin n_pairs / sum r^2
+            # in a single device-side call each, then one .get().
+            n_bin_arr = cp.bincount(cb, minlength=n_bins)[:n_bins]
+            s_bin_arr = cp.bincount(cb, weights=v, minlength=n_bins)[:n_bins]
+            accum[pop_label]["sum_r2"] += s_bin_arr.get()
+            accum[pop_label]["n_pairs"] += n_bin_arr.get().astype(np.int64)
+            del hap_pop, iu, ju, d, v, cb, n_bin_arr, s_bin_arr
+
+        del eager, eager_filt, haps_filt, pos_filt
         free_gpu()
         print(f"  probe {pi_+1}/{len(lefts)} "
               f"[{int(left)/1e6:.1f}-{right/1e6:.1f} Mb] "
-              f"in {time.perf_counter()-t0:.1f}s", flush=True)
+              f"{n_var} common SNPs in {time.perf_counter()-t0:.1f}s",
+              flush=True)
 
     rows = []
     for c in cats:
         for i, (l_bp, h_bp) in enumerate(zip(bins[:-1], bins[1:])):
-            dd, dz, p2 = accum[c]["DD"][i], accum[c]["Dz"][i], accum[c]["pi2"][i]
-            rows.append({"pop": c, "bin_lo_bp": int(l_bp),
-                         "bin_hi_bp": int(h_bp), "bin_mid_bp": float(mids[i]),
-                         "DD": dd, "Dz": dz, "pi2": p2,
-                         "sigma_d2": dd / p2 if p2 != 0 else float("nan")})
-    return pd.DataFrame(rows)
-
-
-    bins = np.asarray(bp_bins, dtype=float)
-    mids = np.sqrt(np.maximum(bins[:-1], 1.0) * bins[1:])
-    mids[0] = bins[1] / 2.0
-    rows = []
-    # DD / Dz / pi2 for: within-pop1, within-pop2, between-pop pair.
-    label_to_stats = {afr: ("DD_0_0", "Dz_0_0_0", "pi2_0_0_0_0"),
-                      eur: ("DD_1_1", "Dz_1_1_1", "pi2_1_1_1_1"),
-                      f"{afr}_{eur}": ("DD_0_1", "Dz_0_0_1", "pi2_0_0_1_1")}
-    for i, (lo, hi) in enumerate(zip(bins[:-1], bins[1:])):
-        stats = result[(float(lo), float(hi))]
-        for label, (k_dd, k_dz, k_pi2) in label_to_stats.items():
-            dd, dz, p2 = stats[k_dd], stats[k_dz], stats[k_pi2]
-            rows.append({"pop": label, "bin_lo_bp": int(lo),
-                         "bin_hi_bp": int(hi), "bin_mid_bp": float(mids[i]),
-                         "DD": dd, "Dz": dz, "pi2": p2,
-                         "sigma_d2": dd / p2 if p2 != 0 else float("nan")})
+            dd = accum[c]["DD"][i]
+            dz = accum[c]["Dz"][i]
+            p2 = accum[c]["pi2"][i]
+            srr = accum[c]["sum_r2"][i]
+            np_pairs = int(accum[c]["n_pairs"][i])
+            rows.append({
+                "pop": c,
+                "bin_lo_bp": int(l_bp),
+                "bin_hi_bp": int(h_bp),
+                "bin_mid_bp": float(mids[i]),
+                "mean_r2": srr / np_pairs if np_pairs > 0 else float("nan"),
+                "n_pairs": np_pairs,
+                "DD": dd, "Dz": dz, "pi2": p2,
+                "sigma_d2": dd / p2 if p2 != 0 else float("nan"),
+            })
     return pd.DataFrame(rows)
 
 
@@ -430,19 +491,19 @@ def _scan_panel(ax, x_mb, series, ylabel, title, hline=None, legend=False):
 
 
 def _draw_ld_decay(ax, ld_r2, n_ld_sub, title_size=10, title=None):
-    """Per-pop sigma_d^2 vs distance from the LD-decay table."""
+    """Per-pop mean r^2 vs distance from the LD-decay table."""
     for p in POPS:
-        mids, sig = ld_r2[p]
-        ax.plot(mids, sig, "o-", color=POP_COLORS[p], lw=1.5, ms=5, label=p)
+        mids, mean_r2 = ld_r2[p]
+        ax.plot(mids, mean_r2, "o-", color=POP_COLORS[p], lw=1.5, ms=5, label=p)
     ax.set_xscale("log")
     ax.set_xlabel("Distance between SNPs (bp)", fontsize=10)
-    ax.set_ylabel(r"$\sigma_d^2 = DD / \pi^2$", fontsize=10)
+    ax.set_ylabel(r"mean $r^2$", fontsize=10)
     ax.set_ylim(bottom=0)
     ax.grid(True, which="both", alpha=0.3)
     ax.tick_params(labelsize=9)
     ax.legend(fontsize=9, title="population", title_fontsize=9)
     if title is None:
-        title = (f"LD decay (moments-LD $\\sigma_d^2$, common SNPs)\n"
+        title = (f"LD decay (mean $r^2$, MAF $\\geq$ {LD_DECAY_MIN_MAF})\n"
                  f"{n_ld_sub:,} haps/pop")
     if title:
         ax.set_title(title, fontsize=title_size, fontweight="bold", loc="left")
@@ -692,12 +753,16 @@ def main():
     t0 = time.perf_counter()
     ld_decay_df = run_ld_decay(stream, POPS, LD_BP_BINS,
                                 subsample=LD_SUBSAMPLE,
-                                max_snps_per_probe=LD_DECAY_MAX_SNPS)
+                                max_snps_per_probe=LD_DECAY_MAX_SNPS,
+                                min_maf=LD_DECAY_MIN_MAF)
     print(f"  {len(ld_decay_df)} bin x pop entries "
           f"in {time.perf_counter()-t0:.1f}s")
     ld_decay_df.to_csv(TABLES_DIR / "ld_decay.csv", index=False)
+    # Headline plot uses naive mean r^2 per pop (matches the convention
+    # most empirical LD-decay figures use). The moments-LD columns
+    # stay in ld_decay.csv for the paper's quantitative claims.
     ld_r2 = {p: (ld_decay_df.loc[ld_decay_df["pop"] == p, "bin_mid_bp"].to_numpy(),
-                 ld_decay_df.loc[ld_decay_df["pop"] == p, "sigma_d2"].to_numpy())
+                 ld_decay_df.loc[ld_decay_df["pop"] == p, "mean_r2"].to_numpy())
              for p in POPS}
 
     # Pairwise r^2 heatmap centered on the variant-bearing range (not
@@ -734,6 +799,7 @@ def main():
         "garud_subsample": min(GARUD_SUBSAMPLE, n_haps_per_pop),
         "joint_sfs_subsample": min(JOINT_SFS_SUBSAMPLE, n_haps_per_pop),
         "ld_subsample": n_ld_sub,
+        "ld_decay_min_maf": LD_DECAY_MIN_MAF,
         "ld_heatmap_min_maf": LD_HEATMAP_MIN_MAF,
         "ld_heatmap_region": list(region),
         "ld_heatmap_n_snps": int(r2_mat.shape[0]),

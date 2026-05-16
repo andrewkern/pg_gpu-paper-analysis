@@ -85,7 +85,7 @@ def main():
 
     decay_df = pd.read_csv(tdir / "ld_decay.csv")
     ld_r2 = {p: (decay_df.loc[decay_df["pop"] == p, "bin_mid_bp"].to_numpy(),
-                 decay_df.loc[decay_df["pop"] == p, "sigma_d2"].to_numpy())
+                 decay_df.loc[decay_df["pop"] == p, "mean_r2"].to_numpy())
              for p in gs.POPS}
 
     x_lo_mb = float(np.floor(main_df["start"].min() / 1e6))
