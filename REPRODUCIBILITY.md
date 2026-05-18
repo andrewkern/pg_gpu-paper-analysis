@@ -1,14 +1,18 @@
 # how to remake every figure in the paper
 
-Every figure in `paper/main.tex` is in the table below paired with the
-script that made it. Run from the repo root, inside the `pg_gpu` pixi
-env (or the `moments` feature where noted), with a free GPU picked via
-`CUDA_VISIBLE_DEVICES`. `make <section>/<thing>` runs the same command
-if you'd rather use Make.
+The paper itself lives in
+[`andrewkern/pg_gpu-paper`](https://github.com/andrewkern/pg_gpu-paper);
+this repo is included there as a submodule under `analysis/`. Every
+figure in the paper's `main.tex` is in the table below paired with
+the script in this repo that made it. Run from this repo's root,
+inside the `pg_gpu` pixi env (or the `moments` feature where noted),
+with a free GPU picked via `CUDA_VISIBLE_DEVICES`. `make
+<section>/<thing>` runs the same command if you'd rather use Make.
 
-The paper pulls figures from `paper/figures/`, but each script writes
-into its own section's `figures/`. So: rerun the script, eyeball the
-new one, copy it over.
+Each script writes its figure into its own section's `figures/` here.
+The paper consumes from its own `figures/` directory at the root of
+`pg_gpu-paper`. So: rerun the script, eyeball the new one, copy it up
+into the parent repo's `figures/`.
 
 ## the figures
 
@@ -31,9 +35,9 @@ new one, copy it over.
 ## five figures we cant rebuild yet
 
 These five are in the paper but nothing on disk in either repo makes
-them. They got dropped into `paper/figures/` at some point and whatever
-script made them never got commited. We need to find it or rewrite it
-before the preprint goes out.
+them. They got dropped into the parent repo's `figures/` at some point
+and whatever script made them never got commited. We need to find it
+or rewrite it before the preprint goes out.
 
 - `moments_ld_validation.pdf`
 - `moments_ld_2pop.png`
