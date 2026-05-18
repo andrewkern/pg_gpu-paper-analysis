@@ -23,6 +23,11 @@ into the parent repo's `figures/`.
 | `scikit_allel_comparison.pdf` | `01_accuracy/scripts/scikit_allel_comparison.py` | `make 01_accuracy/scikit_allel_comparison` |
 | `moments_3pop_true_model.png` | `01_accuracy/scripts/moments_integration_demo.py` | `make 01_accuracy/moments_integration_demo` |
 | `moments_3pop_fitted_vs_observed.png` | same script as the line above | same |
+| `moments_ld_2pop.png` | `01_accuracy/scripts/multipop_ld_benchmark.py 2` | `make 01_accuracy/multipop_ld_benchmark_2pop` |
+| `moments_ld_3pop.png` | `01_accuracy/scripts/multipop_ld_benchmark.py 3` | `make 01_accuracy/multipop_ld_benchmark_3pop` |
+| `moments_ld_4pop.png` | `01_accuracy/scripts/multipop_ld_benchmark.py 4` | `make 01_accuracy/multipop_ld_benchmark_4pop` |
+| `moments_ld_validation.pdf` | `01_accuracy/scripts/four_pop_ld_demo.py` | `make 01_accuracy/four_pop_ld_demo` |
+| `moments_ld_decay_comparison.pdf` | `01_accuracy/scripts/moments_ld_decay_comparison.py` | `make 01_accuracy/moments_ld_decay_comparison` |
 | `benchmark_speedups.pdf` | `02_performance/scripts/benchmark_3R.py` | `make 02_performance/benchmark_3R` |
 | `benchmark_walltimes.pdf` | same | same |
 | `benchmark_simulated.pdf` | `02_performance/scripts/benchmark_simulated.py` | `make 02_performance/benchmark_simulated` |
@@ -32,31 +37,18 @@ into the parent repo's `figures/`.
 | `local_pca.png` | `05_application/scripts/local_pca.py` | `make 05_application/local_pca` |
 | `genome_scan_ooa.pdf` | `06_simulated_genome_scan/scripts/genome_scan_ooa.py` (after `simulate_ooa_genome.py` + `ts_to_vcz.py`) | `make 06_simulated_genome_scan` |
 
-## five figures we cant rebuild yet
+## scripts mirrored or recovered from pg_gpu
 
-These five are in the paper but nothing on disk in either repo makes
-them. They got dropped into the parent repo's `figures/` at some point
-and whatever script made them never got commited. We need to find it
-or rewrite it before the preprint goes out.
+Several of the scripts above are not original to this repo. The copy
+here is what makes the paper figure -- if you edit the original, sync
+it back over. Each one has a note up top pointing at where it came
+from.
 
-- `moments_ld_validation.pdf`
-- `moments_ld_2pop.png`
-- `moments_ld_3pop.png`
-- `moments_ld_4pop.png`
-- `moments_ld_decay_comparison.pdf`
-
-`moments_integration_demo.py` handles the 3-pop inference figures
-(`moments_3pop_*`) but not these LD validation ones.
-
-## three scripts copied in from pg_gpu
-
-Three of the scripts above are copies of files that live in
-`pg_gpu/examples/`. The copy here is the one that makes the paper
-figure -- if you edit the original, sync it back over. Each one has a
-note up top pointing at the original.
-
-| copy | original |
+| copy | source |
 |---|---|
-| `01_accuracy/scripts/scikit_allel_comparison.py` | `pg_gpu/examples/scikit_allel_comparison.py` |
-| `01_accuracy/scripts/moments_integration_demo.py` | `pg_gpu/examples/moments_integration_demo.py` |
-| `05_application/scripts/local_pca.py` | `pg_gpu/examples/local_pca.py` |
+| `01_accuracy/scripts/scikit_allel_comparison.py` | `pg_gpu/examples/scikit_allel_comparison.py` (current) |
+| `01_accuracy/scripts/moments_integration_demo.py` | `pg_gpu/examples/moments_integration_demo.py` (current) |
+| `05_application/scripts/local_pca.py` | `pg_gpu/examples/local_pca.py` (current) |
+| `01_accuracy/scripts/multipop_ld_benchmark.py` | `pg_gpu/examples/multipop_ld_benchmark.py` at d0a2cf8^ (removed by PR #61) |
+| `01_accuracy/scripts/four_pop_ld_demo.py` | `pg_gpu/examples/four_pop_ld_demo.py` at d0a2cf8^ (removed by PR #61) |
+| `01_accuracy/scripts/moments_ld_decay_comparison.py` | older `pg_gpu/examples/moments_integration_demo.py` at 1149612^ (the plot was dropped by PR #60 when the demo was rewritten for three populations) |

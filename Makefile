@@ -54,6 +54,11 @@ endef
                     01_accuracy/missing_data_bias \
                     01_accuracy/scikit_allel_comparison \
                     01_accuracy/moments_integration_demo \
+                    01_accuracy/multipop_ld_benchmark_2pop \
+                    01_accuracy/multipop_ld_benchmark_3pop \
+                    01_accuracy/multipop_ld_benchmark_4pop \
+                    01_accuracy/four_pop_ld_demo \
+                    01_accuracy/moments_ld_decay_comparison \
         02_performance 02_performance/benchmark_3R \
                        02_performance/benchmark_simulated \
         03_scaling 03_scaling/scaling_samples_variants \
@@ -108,7 +113,12 @@ all: 01_accuracy 02_performance 03_scaling 05_application 06_simulated_genome_sc
              01_accuracy/accuracy_vs_plink \
              01_accuracy/missing_data_bias \
              01_accuracy/scikit_allel_comparison \
-             01_accuracy/moments_integration_demo
+             01_accuracy/moments_integration_demo \
+             01_accuracy/multipop_ld_benchmark_2pop \
+             01_accuracy/multipop_ld_benchmark_3pop \
+             01_accuracy/multipop_ld_benchmark_4pop \
+             01_accuracy/four_pop_ld_demo \
+             01_accuracy/moments_ld_decay_comparison
 
 01_accuracy/accuracy_vs_allel:
 	$(call timed,$(PIXI_PY) 01_accuracy/scripts/accuracy_vs_allel.py)
@@ -124,6 +134,23 @@ all: 01_accuracy 02_performance 03_scaling 05_application 06_simulated_genome_sc
 
 01_accuracy/moments_integration_demo:
 	$(call timed,$(PIXI_MOMENTS_PY) 01_accuracy/scripts/moments_integration_demo.py)
+
+# multipop_ld_benchmark.py takes n_pops as a positional arg; one
+# Make target per n_pops value used in the paper.
+01_accuracy/multipop_ld_benchmark_2pop:
+	$(call timed,$(PIXI_MOMENTS_PY) 01_accuracy/scripts/multipop_ld_benchmark.py 2)
+
+01_accuracy/multipop_ld_benchmark_3pop:
+	$(call timed,$(PIXI_MOMENTS_PY) 01_accuracy/scripts/multipop_ld_benchmark.py 3)
+
+01_accuracy/multipop_ld_benchmark_4pop:
+	$(call timed,$(PIXI_MOMENTS_PY) 01_accuracy/scripts/multipop_ld_benchmark.py 4)
+
+01_accuracy/four_pop_ld_demo:
+	$(call timed,$(PIXI_MOMENTS_PY) 01_accuracy/scripts/four_pop_ld_demo.py)
+
+01_accuracy/moments_ld_decay_comparison:
+	$(call timed,$(PIXI_MOMENTS_PY) 01_accuracy/scripts/moments_ld_decay_comparison.py)
 
 # -----------------------------------------------------------------------
 # 02_performance -- wall-clock benchmarks on the full Ag1000G 3R arm
