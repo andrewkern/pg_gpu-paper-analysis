@@ -43,10 +43,19 @@ The simulated biobank-scale scan in `06_simulated_genome_scan/` is the
 only section with a multi-stage pipeline. `stdpopsim` is not added to
 the `pg_gpu` pixi environment; it lives in a local virtualenv at the
 repo root (`python3 -m venv .venv && .venv/bin/pip install stdpopsim`,
-gitignored). See `06_simulated_genome_scan/scripts/` for the
-`simulate_ooa_genome.py` → `ts_to_vcz.py` → `genome_scan_ooa.py`
-sequence and `CLAUDE.md` for the full step-by-step. The scan completes
-in ~16 minutes on a single A100 80 GB for 100k diploids on chr15.
+gitignored). The three scripts run in order:
+
+```bash
+.venv/bin/python 06_simulated_genome_scan/scripts/simulate_ooa_genome.py \
+    --chromosomes 15 --num-samples 50000
+.venv/bin/python 06_simulated_genome_scan/scripts/ts_to_vcz.py \
+    --trees 06_simulated_genome_scan/data/ooa_2t12/chr15.trees
+CUDA_VISIBLE_DEVICES=0 python 06_simulated_genome_scan/scripts/genome_scan_ooa.py
+```
+
+The first two run from the local venv (stdpopsim/tskit/zarr only);
+the third runs inside the `pg_gpu` pixi env. The scan completes in
+~16 minutes on a single A100 80 GB for 100k diploids on chr15.
 
 ## External data
 
