@@ -83,19 +83,7 @@ For an end-to-end map of every paper figure to the exact script that
 produced it (including a flagged set of figures whose producer is
 currently missing), see [`REPRODUCIBILITY.md`](REPRODUCIBILITY.md).
 
-## Outputs are checked in
-
-PDFs, PNGs, and CSVs under `*/figures/` and `*/tables/` are committed
-to git — the manuscript consumes them directly. Re-running a script
-will produce a dirty working tree; commit the regenerated outputs
-alongside the code change that produced them so the artifacts and
-the code that made them stay in sync.
 
 ## License
 
 MIT — see [`LICENSE`](LICENSE).
-
-## Citation
-
-See [`CITATION.cff`](CITATION.cff). The preprint DOI will be filled
-in once the manuscript is on bioRxiv.
