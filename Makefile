@@ -52,7 +52,6 @@ endef
         02_performance 02_performance/benchmark_3R \
                        02_performance/benchmark_simulated \
         03_scaling 03_scaling/scaling_samples_variants \
-        04_achaz_framework 04_achaz_framework/neutrality_test_calibration \
         05_application 05_application/build_populations \
                        05_application/ag1000g_workflow \
                        05_application/ag1000g_lostruct \
@@ -82,14 +81,13 @@ estimates:
 	@echo "  01_accuracy                ~15-20 min"
 	@echo "  02_performance             ~45-60 min  (~30 min for stress_test_3R if /home/adkern/pg_gpu/debug/stress_test_3R_results.txt is absent)"
 	@echo "  03_scaling                 ~15-25 min"
-	@echo "  04_achaz_framework          ~5-15 min"
 	@echo "  05_application             ~10-20 min"
 	@echo "  06_simulated_genome_scan   ~16 min   (assumes chr15.vcz on disk)"
 	@echo "  total                      ~1.5-2.5 h serial"
 	@echo ""
 	@echo "  06_full adds ~3-4 h to regenerate chr15 from stdpopsim."
 
-all: 01_accuracy 02_performance 03_scaling 04_achaz_framework 05_application 06_simulated_genome_scan
+all: 01_accuracy 02_performance 03_scaling 05_application 06_simulated_genome_scan
 	@echo "All sections completed."
 
 # -----------------------------------------------------------------------
@@ -131,15 +129,6 @@ all: 01_accuracy 02_performance 03_scaling 04_achaz_framework 05_application 06_
 
 03_scaling/scaling_samples_variants:
 	$(call timed,$(PIXI_PY) 03_scaling/scripts/scaling_samples_variants.py)
-
-# -----------------------------------------------------------------------
-# 04_achaz_framework -- neutrality-test calibration under the SNM
-# -----------------------------------------------------------------------
-
-04_achaz_framework: 04_achaz_framework/neutrality_test_calibration
-
-04_achaz_framework/neutrality_test_calibration:
-	$(call timed,$(PIXI_PY) 04_achaz_framework/scripts/neutrality_test_calibration.py)
 
 # -----------------------------------------------------------------------
 # 05_application -- end-to-end Ag1000G workflow + lostruct

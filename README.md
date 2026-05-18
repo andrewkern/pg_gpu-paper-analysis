@@ -13,7 +13,6 @@ that the manuscript consumes directly.
 | `01_accuracy/` | Numerical accuracy of pg_gpu against scikit-allel, PLINK, and moments |
 | `02_performance/` | Wall-clock benchmarks on real Ag1000G 3R data |
 | `03_scaling/` | Sample-size and variant-count scaling sweeps |
-| `04_achaz_framework/` | Neutrality test calibration via Achaz (2009) |
 | `05_application/` | End-to-end Ag1000G workflow (population assignments, genome scan, summary tables) |
 | `06_simulated_genome_scan/` | Biobank-scale simulated chr15 (`stdpopsim` `OutOfAfrica_2T12`, 100k diploids) end-to-end scan using the pg_gpu streaming API |
 
