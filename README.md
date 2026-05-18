@@ -13,7 +13,6 @@ that the manuscript consumes directly.
 | `01_accuracy/` | Numerical accuracy of pg_gpu against scikit-allel, PLINK, and moments |
 | `02_performance/` | Wall-clock benchmarks on real Ag1000G 3R data |
 | `03_scaling/` | Sample-size and variant-count scaling sweeps |
-| `04_achaz_framework/` | Neutrality test calibration via Achaz (2009) |
 | `05_application/` | End-to-end Ag1000G workflow (population assignments, genome scan, summary tables) |
 | `06_simulated_genome_scan/` | Biobank-scale simulated chr15 (`stdpopsim` `OutOfAfrica_2T12`, 100k diploids) end-to-end scan using the pg_gpu streaming API |
 
@@ -44,10 +43,19 @@ The simulated biobank-scale scan in `06_simulated_genome_scan/` is the
 only section with a multi-stage pipeline. `stdpopsim` is not added to
 the `pg_gpu` pixi environment; it lives in a local virtualenv at the
 repo root (`python3 -m venv .venv && .venv/bin/pip install stdpopsim`,
-gitignored). See `06_simulated_genome_scan/scripts/` for the
-`simulate_ooa_genome.py` → `ts_to_vcz.py` → `genome_scan_ooa.py`
-sequence and `CLAUDE.md` for the full step-by-step. The scan completes
-in ~16 minutes on a single A100 80 GB for 100k diploids on chr15.
+gitignored). The three scripts run in order:
+
+```bash
+.venv/bin/python 06_simulated_genome_scan/scripts/simulate_ooa_genome.py \
+    --chromosomes 15 --num-samples 50000
+.venv/bin/python 06_simulated_genome_scan/scripts/ts_to_vcz.py \
+    --trees 06_simulated_genome_scan/data/ooa_2t12/chr15.trees
+CUDA_VISIBLE_DEVICES=0 python 06_simulated_genome_scan/scripts/genome_scan_ooa.py
+```
+
+The first two run from the local venv (stdpopsim/tskit/zarr only);
+the third runs inside the `pg_gpu` pixi env. The scan completes in
+~16 minutes on a single A100 80 GB for 100k diploids on chr15.
 
 ## External data
 
@@ -62,8 +70,18 @@ A handful of scripts read absolute paths under
   `05_application/build_populations.py`.
 * `Ag3.0/args_trees/singer-test/3R.mask.bed` — accessibility mask.
 
+`01_accuracy/scripts/scikit_allel_comparison.py` additionally reads
+phased zarr fixtures from `/home/adkern/pg_gpu/examples/data/`
+(checked into the pg_gpu repo, not duplicated here).
+
 If those paths are not available, update the constants at the top of
 the affected scripts.
+
+## Per-figure provenance
+
+For an end-to-end map of every paper figure to the exact script that
+produced it (including a flagged set of figures whose producer is
+currently missing), see [`REPRODUCIBILITY.md`](REPRODUCIBILITY.md).
 
 ## Outputs are checked in
 

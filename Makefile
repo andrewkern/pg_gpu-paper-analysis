@@ -26,6 +26,9 @@ CUDA ?= 0
 PIXI_MANIFEST ?= /home/adkern/pg_gpu/pixi.toml
 
 PIXI_PY = CUDA_VISIBLE_DEVICES=$(CUDA) pixi run --manifest-path $(PIXI_MANIFEST) python
+# moments_integration_demo needs the moments feature: msprime + demes +
+# demesdraw + moments.LD. pg_gpu ships this as a separate pixi env.
+PIXI_MOMENTS_PY = CUDA_VISIBLE_DEVICES=$(CUDA) pixi run -e moments --manifest-path $(PIXI_MANIFEST) python
 VENV_PY = .venv/bin/python
 
 # Wrap a command with a stamped wall-time line so a `make all` log
@@ -49,14 +52,16 @@ endef
         01_accuracy 01_accuracy/accuracy_vs_allel \
                     01_accuracy/accuracy_vs_plink \
                     01_accuracy/missing_data_bias \
+                    01_accuracy/scikit_allel_comparison \
+                    01_accuracy/moments_integration_demo \
         02_performance 02_performance/benchmark_3R \
                        02_performance/benchmark_simulated \
         03_scaling 03_scaling/scaling_samples_variants \
-        04_achaz_framework 04_achaz_framework/neutrality_test_calibration \
         05_application 05_application/build_populations \
                        05_application/ag1000g_workflow \
                        05_application/ag1000g_lostruct \
                        05_application/make_figure \
+                       05_application/local_pca \
         06_simulated_genome_scan 06_full \
                        06_simulated_genome_scan/simulate \
                        06_simulated_genome_scan/ts_to_vcz \
@@ -82,23 +87,28 @@ estimates:
 	@echo "  01_accuracy                ~15-20 min"
 	@echo "  02_performance             ~45-60 min  (~30 min for stress_test_3R if /home/adkern/pg_gpu/debug/stress_test_3R_results.txt is absent)"
 	@echo "  03_scaling                 ~15-25 min"
-	@echo "  04_achaz_framework          ~5-15 min"
 	@echo "  05_application             ~10-20 min"
 	@echo "  06_simulated_genome_scan   ~16 min   (assumes chr15.vcz on disk)"
 	@echo "  total                      ~1.5-2.5 h serial"
 	@echo ""
 	@echo "  06_full adds ~3-4 h to regenerate chr15 from stdpopsim."
 
-all: 01_accuracy 02_performance 03_scaling 04_achaz_framework 05_application 06_simulated_genome_scan
+all: 01_accuracy 02_performance 03_scaling 05_application 06_simulated_genome_scan
 	@echo "All sections completed."
 
 # -----------------------------------------------------------------------
-# 01_accuracy -- pg_gpu vs scikit-allel + PLINK on a 4 Mb Ag1000G 3L region
+# 01_accuracy -- pg_gpu numerical agreement with scikit-allel, PLINK,
+# and moments. scikit_allel_comparison reads zarr fixtures from
+# /home/adkern/pg_gpu/examples/data/; moments_integration_demo runs in
+# the moments pixi feature because msprime/demes/moments aren't in the
+# default env.
 # -----------------------------------------------------------------------
 
 01_accuracy: 01_accuracy/accuracy_vs_allel \
              01_accuracy/accuracy_vs_plink \
-             01_accuracy/missing_data_bias
+             01_accuracy/missing_data_bias \
+             01_accuracy/scikit_allel_comparison \
+             01_accuracy/moments_integration_demo
 
 01_accuracy/accuracy_vs_allel:
 	$(call timed,$(PIXI_PY) 01_accuracy/scripts/accuracy_vs_allel.py)
@@ -108,6 +118,12 @@ all: 01_accuracy 02_performance 03_scaling 04_achaz_framework 05_application 06_
 
 01_accuracy/missing_data_bias:
 	$(call timed,$(PIXI_PY) 01_accuracy/scripts/missing_data_bias.py)
+
+01_accuracy/scikit_allel_comparison:
+	$(call timed,$(PIXI_PY) 01_accuracy/scripts/scikit_allel_comparison.py)
+
+01_accuracy/moments_integration_demo:
+	$(call timed,$(PIXI_MOMENTS_PY) 01_accuracy/scripts/moments_integration_demo.py)
 
 # -----------------------------------------------------------------------
 # 02_performance -- wall-clock benchmarks on the full Ag1000G 3R arm
@@ -133,15 +149,6 @@ all: 01_accuracy 02_performance 03_scaling 04_achaz_framework 05_application 06_
 	$(call timed,$(PIXI_PY) 03_scaling/scripts/scaling_samples_variants.py)
 
 # -----------------------------------------------------------------------
-# 04_achaz_framework -- neutrality-test calibration under the SNM
-# -----------------------------------------------------------------------
-
-04_achaz_framework: 04_achaz_framework/neutrality_test_calibration
-
-04_achaz_framework/neutrality_test_calibration:
-	$(call timed,$(PIXI_PY) 04_achaz_framework/scripts/neutrality_test_calibration.py)
-
-# -----------------------------------------------------------------------
 # 05_application -- end-to-end Ag1000G workflow + lostruct
 # build_populations writes 05_application/tables/population_assignments.json
 # that ag1000g_workflow reads; make_figure consumes the workflow + lostruct
@@ -151,7 +158,8 @@ all: 01_accuracy 02_performance 03_scaling 04_achaz_framework 05_application 06_
 05_application: 05_application/build_populations \
                 05_application/ag1000g_workflow \
                 05_application/ag1000g_lostruct \
-                05_application/make_figure
+                05_application/make_figure \
+                05_application/local_pca
 
 05_application/build_populations:
 	$(call timed,$(PIXI_PY) 05_application/scripts/build_populations.py)
@@ -164,6 +172,10 @@ all: 01_accuracy 02_performance 03_scaling 04_achaz_framework 05_application 06_
 
 05_application/make_figure: 05_application/ag1000g_workflow 05_application/ag1000g_lostruct
 	$(call timed,$(PIXI_PY) 05_application/scripts/make_figure.py)
+
+# Simulated-sweep local-PCA demo. Self-contained -- msprime + scipy + pg_gpu.
+05_application/local_pca:
+	$(call timed,$(PIXI_PY) 05_application/scripts/local_pca.py)
 
 # -----------------------------------------------------------------------
 # 06_simulated_genome_scan -- biobank-scale chr15 OOA scan

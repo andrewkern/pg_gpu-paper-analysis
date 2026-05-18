@@ -93,7 +93,12 @@ GARUD_SCALE_BP = 10_000        # Garud's H windowed at this scale
 
 # Subsamples for stats that can't take the full sample axis cheaply.
 GARUD_SUBSAMPLE = 1000          # capped by the ~1024-hap Garud kernel
-JOINT_SFS_SUBSAMPLE = 200       # full joint SFS would be n_hap^2 cells
+# Joint SFS projection target. The full (n_hap+1, n_hap+1) joint SFS
+# is 80 GB at 100k haps/pop -- bigger than the A100 -- so we instead
+# project the full-panel joint SFS down to this size on the fly via
+# pg_gpu.sfs.project_joint_sfs. Result is mass-preserving and uses
+# every variant from every haplotype, not a sample of them.
+JOINT_SFS_TARGET = 200
 
 # LD-decay haplotype subsample per pop. Each pair-count step reads
 # n_hap entries for both endpoints, so cost scales linearly with this.
@@ -172,7 +177,10 @@ def run_one_pass_scan(stream, populations):
 
       * windowed diversity + divergence at every scale in ``WINDOW_SCALES``,
       * per-pop marginal SFS,
-      * joint SFS on the small ``JOINT_SFS_SUBSAMPLE`` per pop,
+      * joint SFS projected from the full panel to ``JOINT_SFS_TARGET``
+        per pop via per-variant hypergeometric projection (the
+        ``(n_hap+1, n_hap+1)`` full histogram would not fit at biobank
+        scale),
       * Garud's H per pop on the ``GARUD_SUBSAMPLE`` per pop (registered
         as a temporary pop ``{pop}_g`` on each chunk).
 
@@ -186,7 +194,6 @@ def run_one_pass_scan(stream, populations):
     # only accepts list values (streaming source hands them as numpy arrays).
     full_pop_lists = {p: [int(i) for i in stream.sample_sets[p]]
                        for p in populations}
-    sub_j = {p: full_pop_lists[p][:JOINT_SFS_SUBSAMPLE] for p in populations}
     sub_g = {p: full_pop_lists[p][:GARUD_SUBSAMPLE] for p in populations}
 
     windowed = {label: [] for label, _ in WINDOW_SCALES}
@@ -246,8 +253,15 @@ def run_one_pass_scan(stream, populations):
         for p in populations:
             s = np.asarray(sfs.sfs(chunk_hm, population=p))
             marginal_sfs[p] = s if marginal_sfs[p] is None else marginal_sfs[p] + s
-        j = np.asarray(sfs.joint_sfs(chunk_hm, pop1=sub_j[populations[0]],
-                                       pop2=sub_j[populations[1]]))
+        # Hypergeometric projection of the per-chunk joint SFS into
+        # the (target+1, target+1) display grid. Mathematically the
+        # same as ``P1 @ joint_sfs(chunk) @ P2.T`` but applied
+        # per-variant so the (n_hap+1, n_hap+1) full histogram --
+        # which would be 80 GB at 100k haps/pop -- is never formed.
+        j = np.asarray(sfs.project_joint_sfs(
+            chunk_hm, pop1=populations[0], pop2=populations[1],
+            target_n1=JOINT_SFS_TARGET, target_n2=JOINT_SFS_TARGET,
+        ))
         joint = j if joint is None else joint + j
 
         del chunk_hm
@@ -575,7 +589,7 @@ def _draw_r2_heatmap(ax, r2_mat, hm_pos, chrom, region, n_hm_haps,
 
 def plot_composite(df_main, garud_df, joint, ld_r2, r2_mat, hm_pos, n_hm_haps,
                    chrom, x_lo_mb, chrom_len, n_haps_per_pop, scale_label,
-                   ld_region, n_garud_sub, n_joint_sub, n_ld_sub,
+                   ld_region, n_garud_sub, n_joint_target, n_ld_sub,
                    subtitle_extra, out_base):
     afr, eur = POPS
     x = df_main["center"].values / 1e6
@@ -644,7 +658,8 @@ def plot_composite(df_main, garud_df, joint, ld_r2, r2_mat, hm_pos, n_hm_haps,
                      aspect="equal", cmap="viridis", interpolation="nearest")
     ax_j.set_xlabel(f"{afr} derived allele count", fontsize=8)
     ax_j.set_ylabel(f"{eur} derived allele count", fontsize=8)
-    ax_j.set_title("Joint SFS", fontsize=11, fontweight="bold", pad=4, loc="left")
+    ax_j.set_title(f"Joint SFS (projected to {n_joint_target} haps/pop)",
+                    fontsize=11, fontweight="bold", pad=4, loc="left")
     ax_j.tick_params(labelsize=7)
     cb = plt.colorbar(im, ax=ax_j, fraction=0.046, pad=0.04, shrink=0.85)
     cb.ax.tick_params(labelsize=7)
@@ -805,7 +820,7 @@ def main():
         "haplotypes_per_pop": n_haps_per_pop,
         "n_sites": int(stream.num_variants),
         "garud_subsample": min(GARUD_SUBSAMPLE, n_haps_per_pop),
-        "joint_sfs_subsample": min(JOINT_SFS_SUBSAMPLE, n_haps_per_pop),
+        "joint_sfs_target": JOINT_SFS_TARGET,
         "ld_subsample": n_ld_sub,
         "ld_decay_min_maf": LD_DECAY_MIN_MAF,
         "ld_heatmap_min_maf": LD_HEATMAP_MIN_MAF,
@@ -834,7 +849,7 @@ def main():
     plot_composite(main_df, garud_df, joint, ld_r2, r2_mat, hm_pos, n_hm_haps,
                    stream.chrom, x_lo_mb, chrom_len, n_haps_per_pop, MAIN_SCALE,
                    region, min(GARUD_SUBSAMPLE, n_haps_per_pop),
-                   min(JOINT_SFS_SUBSAMPLE, n_haps_per_pop), n_ld_sub,
+                   JOINT_SFS_TARGET, n_ld_sub,
                    f"{stream.num_variants:,} variants",
                    str(FIGURES_DIR / "genome_scan_ooa"))
     plot_multiscale(windows_by_scale, stream.chrom, x_lo_mb, chrom_len,
