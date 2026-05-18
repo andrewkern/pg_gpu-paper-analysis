@@ -72,7 +72,8 @@ def main():
     chrom_len = int(summary["chromosome_length"])
     n_haps_per_pop = int(summary["haplotypes_per_pop"])
     n_garud_sub = int(summary["garud_subsample"])
-    n_joint_sub = int(summary["joint_sfs_subsample"])
+    n_joint_target = int(summary.get("joint_sfs_target",
+                                      summary.get("joint_sfs_subsample", 200)))
     n_ld_sub = int(summary["ld_subsample"])
     region = tuple(summary["ld_heatmap_region"])
     n_sites = int(summary["n_sites"])
@@ -119,12 +120,13 @@ def main():
             region = (int(a), int(b))
 
         if not joint_npy.exists():
-            sub = {p: list(stream.sample_sets[p][:n_joint_sub])
-                   for p in gs.POPS}
             t0 = time.perf_counter()
-            joint = np.asarray(sfs.joint_sfs(stream, pop1=sub[gs.POPS[0]],
-                                               pop2=sub[gs.POPS[1]]))
-            print(f"  joint SFS recompute: {time.perf_counter()-t0:.1f}s")
+            joint = np.asarray(sfs.project_joint_sfs(
+                stream, pop1=gs.POPS[0], pop2=gs.POPS[1],
+                target_n1=n_joint_target, target_n2=n_joint_target))
+            print(f"  joint SFS recompute (projected to "
+                  f"{n_joint_target} haps/pop): "
+                  f"{time.perf_counter()-t0:.1f}s")
             np.save(joint_npy, joint)
         else:
             joint = np.load(joint_npy)
@@ -146,7 +148,7 @@ def main():
     print("Plotting ...")
     gs.plot_composite(main_df, garud_df, joint, ld_r2, r2_mat, hm_pos, n_hm_haps,
                       chrom, x_lo_mb, chrom_len, n_haps_per_pop, gs.MAIN_SCALE,
-                      region, n_garud_sub, n_joint_sub, n_ld_sub, subtitle_extra,
+                      region, n_garud_sub, n_joint_target, n_ld_sub, subtitle_extra,
                       str(fdir / "genome_scan_ooa"))
     gs.plot_multiscale(windows_by_scale, chrom, x_lo_mb, chrom_len,
                        str(fdir / "multiscale_ooa"))
