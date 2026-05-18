@@ -37,18 +37,3 @@ into the parent repo's `figures/`.
 | `local_pca.png` | `05_application/scripts/local_pca.py` | `make 05_application/local_pca` |
 | `genome_scan_ooa.pdf` | `06_simulated_genome_scan/scripts/genome_scan_ooa.py` (after `simulate_ooa_genome.py` + `ts_to_vcz.py`) | `make 06_simulated_genome_scan` |
 
-## scripts mirrored or recovered from pg_gpu
-
-Several of the scripts above are not original to this repo. The copy
-here is what makes the paper figure -- if you edit the original, sync
-it back over. Each one has a note up top pointing at where it came
-from.
-
-| copy | source |
-|---|---|
-| `01_accuracy/scripts/scikit_allel_comparison.py` | `pg_gpu/examples/scikit_allel_comparison.py` (current) |
-| `01_accuracy/scripts/moments_integration_demo.py` | `pg_gpu/examples/moments_integration_demo.py` (current) |
-| `05_application/scripts/local_pca.py` | `pg_gpu/examples/local_pca.py` (current) |
-| `01_accuracy/scripts/multipop_ld_benchmark.py` | `pg_gpu/examples/multipop_ld_benchmark.py` at d0a2cf8^ (removed by PR #61) |
-| `01_accuracy/scripts/four_pop_ld_demo.py` | `pg_gpu/examples/four_pop_ld_demo.py` at d0a2cf8^ (removed by PR #61) |
-| `01_accuracy/scripts/moments_ld_decay_comparison.py` | older `pg_gpu/examples/moments_integration_demo.py` at 1149612^ (the plot was dropped by PR #60 when the demo was rewritten for three populations) |
