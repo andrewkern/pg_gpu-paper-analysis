@@ -61,8 +61,18 @@ A handful of scripts read absolute paths under
   `05_application/build_populations.py`.
 * `Ag3.0/args_trees/singer-test/3R.mask.bed` — accessibility mask.
 
+`01_accuracy/scripts/scikit_allel_comparison.py` additionally reads
+phased zarr fixtures from `/home/adkern/pg_gpu/examples/data/`
+(checked into the pg_gpu repo, not duplicated here).
+
 If those paths are not available, update the constants at the top of
 the affected scripts.
+
+## Per-figure provenance
+
+For an end-to-end map of every paper figure to the exact script that
+produced it (including a flagged set of figures whose producer is
+currently missing), see [`REPRODUCIBILITY.md`](REPRODUCIBILITY.md).
 
 ## Outputs are checked in
 
