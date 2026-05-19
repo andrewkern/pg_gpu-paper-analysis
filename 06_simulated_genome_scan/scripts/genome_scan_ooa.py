@@ -748,7 +748,7 @@ def main():
     print(f"Opening {zarr_path} (chunk_bp={CHUNK_BP:,}) ...")
     stream = HaplotypeMatrix.from_zarr(
         str(zarr_path), streaming="always",
-        chunk_bp=CHUNK_BP, prefetch=PREFETCH, pop_file=str(pop_file),
+        chunk_bp=CHUNK_BP, prefetch=PREFETCH, pop_assignment=str(pop_file),
     )
     n_haps_per_pop = len(stream.sample_sets[POPS[0]])
     chrom_len = stream.chrom_end

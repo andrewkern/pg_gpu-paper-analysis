@@ -34,11 +34,17 @@ VENV_PY = .venv/bin/python
 # Wrap a command with a stamped wall-time line so a `make all` log
 # shows section + per-script wall in real time. Avoids a hard
 # dependency on /usr/bin/time (which not every host carries).
+#
+# The wrapper captures $1's exit code (rc), still prints the "done in"
+# timing line even on failure, then exits with rc so make sees a real
+# success/failure -- previously this used ; between commands and the
+# trailing echo masked python crashes as exit 0.
 define timed
 	@echo "[$(@F)] start"; \
 	_t0=$$(date +%s); \
-	$1; \
-	echo "[$(@F)] done in $$(( $$(date +%s) - _t0 ))s"
+	$1; rc=$$?; \
+	echo "[$(@F)] done in $$(( $$(date +%s) - _t0 ))s (rc=$$rc)"; \
+	exit $$rc
 endef
 
 .DEFAULT_GOAL := help
@@ -65,7 +71,6 @@ endef
         05_application 05_application/build_populations \
                        05_application/ag1000g_workflow \
                        05_application/ag1000g_lostruct \
-                       05_application/make_figure \
                        05_application/local_pca \
         06_simulated_genome_scan 06_full \
                        06_simulated_genome_scan/simulate \
@@ -178,14 +183,12 @@ all: 01_accuracy 02_performance 03_scaling 05_application 06_simulated_genome_sc
 # -----------------------------------------------------------------------
 # 05_application -- end-to-end Ag1000G workflow + lostruct
 # build_populations writes 05_application/tables/population_assignments.json
-# that ag1000g_workflow reads; make_figure consumes the workflow + lostruct
-# tables.
+# that ag1000g_workflow reads.
 # -----------------------------------------------------------------------
 
 05_application: 05_application/build_populations \
                 05_application/ag1000g_workflow \
                 05_application/ag1000g_lostruct \
-                05_application/make_figure \
                 05_application/local_pca
 
 05_application/build_populations:
@@ -196,9 +199,6 @@ all: 01_accuracy 02_performance 03_scaling 05_application 06_simulated_genome_sc
 
 05_application/ag1000g_lostruct:
 	$(call timed,$(PIXI_PY) 05_application/scripts/ag1000g_lostruct.py)
-
-05_application/make_figure: 05_application/ag1000g_workflow 05_application/ag1000g_lostruct
-	$(call timed,$(PIXI_PY) 05_application/scripts/make_figure.py)
 
 # Simulated-sweep local-PCA demo. Self-contained -- msprime + scipy + pg_gpu.
 05_application/local_pca:
