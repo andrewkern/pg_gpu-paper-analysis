@@ -6,6 +6,15 @@ __pycache__/
 cufile.log
 06_simulated_genome_scan/data/
 
+# Scratch directories the moments-feature scripts write during a run
+# (replicate VCFs, recombination maps, samples files, pickled moments
+# LD stats). These are caches the scripts re-fill on demand, not paper
+# artifacts.
+01_accuracy/tables/four_pop_ld_demo_data/
+01_accuracy/tables/moments_3pop_integration_demo/
+01_accuracy/tables/moments_ld_decay_comparison_data/
+01_accuracy/tables/multipop_ld_benchmark_cache/
+
 # Local agent / IDE state
 .claude/
 .vscode/

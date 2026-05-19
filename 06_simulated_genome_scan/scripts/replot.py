@@ -113,7 +113,7 @@ def main():
         print(f"Recomputing missing artifacts from {zarr_path} ...")
         stream = HaplotypeMatrix.from_zarr(
             str(zarr_path), streaming="always", chunk_bp=args.chunk_bp,
-            pop_file=str(pop_file),
+            pop_assignment=str(pop_file),
         )
         if args.ld_region:
             a, b = args.ld_region.split("-")
